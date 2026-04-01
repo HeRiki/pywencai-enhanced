@@ -1,0 +1,45 @@
+name: Bug report
+description: Report a reproducible problem in pywencai-enhanced
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. Please include enough context to reproduce the issue.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What happened?
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: Paste the smallest code sample or request parameters that reproduce the issue.
+      placeholder: |
+        import pywencai
+        pywencai.get(...)
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Python version, OS, Node.js availability, and package version/tag.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or response snippets
+      description: Remove cookies, tokens, and other secrets before pasting.

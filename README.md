@@ -9,6 +9,10 @@
 
 This repository is intended for GitHub installation first. The distribution name is `pywencai-enhanced`, while the Python import name remains `pywencai`.
 
+## Upstream
+
+This project is maintained as an enhanced derivative of [`zsrl/pywencai`](https://github.com/zsrl/pywencai). It keeps API compatibility where practical while improving auth refresh, retry behavior, parser resilience, packaging, and test coverage.
+
 ## Why this fork exists
 
 Compared with the original `pywencai 0.7.1`, this fork focuses on runtime stability and maintainability:

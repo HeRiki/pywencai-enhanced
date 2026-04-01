@@ -9,6 +9,10 @@
 
 这个仓库当前优先面向 GitHub 安装。distribution name 是 `pywencai-enhanced`，但 Python import 名仍然保持为 `pywencai`。
 
+## 上游来源
+
+这个项目基于 [`zsrl/pywencai`](https://github.com/zsrl/pywencai) 进行增强维护。在尽量保持 API 兼容的前提下，重点补强了鉴权刷新、重试策略、解析稳健性、打包方式和测试覆盖。
+
 ## 这个分支改进了什么
 
 相对原始的 `pywencai 0.7.1`，这个版本主要强化了稳定性和工程化能力：
