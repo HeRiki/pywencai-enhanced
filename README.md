@@ -1,5 +1,8 @@
 # pywencai-enhanced
 
+[![CI](https://github.com/HeRiki/pywencai-enhanced/actions/workflows/ci.yml/badge.svg)](https://github.com/HeRiki/pywencai-enhanced/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/HeRiki/pywencai-enhanced/blob/main/LICENSE)
+
 `pywencai-enhanced` is an enhanced fork of [`pywencai`](https://pypi.org/project/pywencai/) that keeps the familiar `from pywencai import get` API while making the real-world request path more resilient.
 
 This repository is intended for GitHub installation first. The distribution name is `pywencai-enhanced`, while the Python import name remains `pywencai`.
@@ -22,7 +25,13 @@ Compared with the original `pywencai 0.7.1`, this fork focuses on runtime stabil
 Install directly from GitHub:
 
 ```bash
-pip install git+https://github.com/<owner>/pywencai-enhanced.git
+pip install git+https://github.com/HeRiki/pywencai-enhanced.git
+```
+
+Install a tagged release:
+
+```bash
+pip install git+https://github.com/HeRiki/pywencai-enhanced.git@v0.1.0
 ```
 
 For local development:
