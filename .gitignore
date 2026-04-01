@@ -1,0 +1,10 @@
+.venv/
+build/
+dist/
+*.egg-info/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+.mypy_cache/
+src/pywencai/node_modules/

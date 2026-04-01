@@ -1,0 +1,17 @@
+{
+  "status_code": 0,
+  "status_msg": "ok",
+  "cost_time": 12,
+  "result": {
+    "answer": [
+      {
+        "txt": [
+          {
+            "content": "{\"components\":[{\"show_type\":\"xuangu_tableV1\",\"cid\":\"cid-2\",\"puuid\":\"uuid-2\",\"data\":{\"meta\":{\"extra\":{\"condition\":\"2026-03-19 涨停\",\"row_count\":24}}},\"config\":{\"other_info\":{\"footer_info\":{\"url\":\"https://www.iwencai.com/unifiedwap/result?w=2026-03-19%20%E6%B6%A8%E5%81%9C&querytype=stock\"}}}}]}"
+          }
+        ]
+      }
+    ]
+  },
+  "debug_info": {}
+}

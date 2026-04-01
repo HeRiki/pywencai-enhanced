@@ -1,0 +1,13 @@
+{
+  "data": {
+    "answer": [
+      {
+        "txt": [
+          {
+            "content": "{\"components\":[{\"show_type\":\"xuangu_tableV1\",\"cid\":\"cid-1\",\"puuid\":\"uuid-1\",\"data\":{\"meta\":{\"extra\":{\"condition\":\"十日涨幅前十\",\"row_count\":2}}},\"config\":{\"other_info\":{\"footer_info\":{\"url\":\"https://www.iwencai.com/unifiedwap/result?w=%E5%8D%81%E6%97%A5%E6%B6%A8%E5%B9%85%E5%89%8D%E5%8D%81&querytype=stock\"}}}}]}"
+          }
+        ]
+      }
+    ]
+  }
+}
