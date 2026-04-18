@@ -10,6 +10,7 @@ from unittest.mock import Mock, patch
 import pandas as pd
 import requests
 
+import pywencai
 from pywencai import convert as convert_module
 from pywencai import headers as headers_module
 from pywencai import wencai as wencai_module
@@ -19,6 +20,7 @@ class TestPyWencaiHelpers(unittest.TestCase):
     def tearDown(self):
         headers_module.clear_runtime_cache()
         wencai_module.clear_runtime_state()
+        pywencai.reset_logger()
 
     def _read_fixture(self, name):
         fixture_path = Path(__file__).resolve().parent / "fixtures" / "pywencai" / name
@@ -77,9 +79,99 @@ class TestPyWencaiHelpers(unittest.TestCase):
         with self.assertLogs(convert_module.logger, level="WARNING") as logs:
             second_handler = convert_module.get_show_type_handler("another_unknown_type")
         self.assertIs(second_handler, convert_module.common_handler)
-        self.assertIn("未识别的show_type", "\n".join(logs.output))
+        log_text = "\n".join(logs.output)
+        self.assertIn("未识别且无法按结构解析的show_type", log_text)
+        self.assertIn("shape=type=NoneType", log_text)
         convert_module.get_show_type_handler("another_unknown_type")
         self.assertEqual(convert_module.UNKNOWN_SHOW_TYPE_COUNTS["another_unknown_type"], 2)
+
+    def test_get_show_type_handler_normalizes_versioned_show_types(self):
+        convert_module.UNKNOWN_SHOW_TYPE_COUNTS.clear()
+
+        with patch.object(convert_module.logger, "warning") as mock_warning:
+            handlers = {
+                "kline2": convert_module.get_show_type_handler("kline2"),
+                "bar3": convert_module.get_show_type_handler("bar3"),
+                "line3": convert_module.get_show_type_handler("line3"),
+                "list3": convert_module.get_show_type_handler("list3"),
+                "txt3": convert_module.get_show_type_handler("txt3"),
+            }
+
+        self.assertIs(handlers["kline2"], convert_module.common_handler)
+        self.assertIs(handlers["bar3"], convert_module.common_handler)
+        self.assertIs(handlers["line3"], convert_module.common_handler)
+        self.assertIs(handlers["list3"], convert_module.common_handler)
+        self.assertIs(handlers["txt3"], convert_module.txt_handler)
+        self.assertEqual(convert_module.UNKNOWN_SHOW_TYPE_COUNTS, {})
+        mock_warning.assert_not_called()
+
+    def test_get_show_type_handler_uses_tab_structure_for_unknown_outer_show_type(self):
+        convert_module.UNKNOWN_SHOW_TYPE_COUNTS.clear()
+        comp = {
+            "show_type": "widget9",
+            "data": {
+                "block_a": {
+                    "datas": [{"股票代码": "600001", "股票名称": "测试股份"}]
+                }
+            },
+            "tab_list": [
+                {
+                    "tab_name": "示例",
+                    "list": [
+                        {
+                            "show_type": "list3",
+                            "data_index": "block_a",
+                        }
+                    ],
+                }
+            ],
+        }
+
+        with patch.object(convert_module.logger, "warning") as mock_warning:
+            handler = convert_module.get_show_type_handler("widget9", comp=comp)
+
+        self.assertIs(handler, convert_module.tab1_handler)
+        self.assertEqual(convert_module.UNKNOWN_SHOW_TYPE_COUNTS, {})
+        mock_warning.assert_not_called()
+
+    def test_get_show_type_handler_uses_common_for_unknown_parseable_component(self):
+        convert_module.UNKNOWN_SHOW_TYPE_COUNTS.clear()
+        comp = {
+            "show_type": "widget9",
+            "data": {
+                "series": [1, 2, 3],
+                "meta": {"name": "示例"},
+            },
+        }
+
+        with patch.object(convert_module.logger, "warning") as mock_warning:
+            handler = convert_module.get_show_type_handler("widget9", comp=comp)
+
+        self.assertIs(handler, convert_module.common_handler)
+        self.assertEqual(convert_module.UNKNOWN_SHOW_TYPE_COUNTS, {})
+        mock_warning.assert_not_called()
+
+    def test_configure_logger_routes_package_logs_to_host_logger(self):
+        configured = pywencai.configure_logger("stock_analysis_app")
+
+        self.assertEqual(configured.name, "stock_analysis_app")
+        self.assertEqual(headers_module.logger.name, "stock_analysis_app")
+        self.assertEqual(convert_module.logger.name, "stock_analysis_app")
+        self.assertEqual(wencai_module.logger.name, "stock_analysis_app")
+
+        with self.assertLogs("stock_analysis_app", level="INFO") as logs:
+            headers_module.write_log("node check message", level="INFO")
+
+        self.assertIn("node check message", "\n".join(logs.output))
+
+    def test_reset_logger_restores_module_loggers(self):
+        pywencai.configure_logger("stock_analysis_app")
+
+        pywencai.reset_logger()
+
+        self.assertEqual(headers_module.logger.name, "pywencai.headers")
+        self.assertEqual(convert_module.logger.name, "pywencai.convert")
+        self.assertEqual(wencai_module.logger.name, "pywencai.wencai")
 
     def test_sanitize_headers_for_logging_redacts_sensitive_values(self):
         sanitized = wencai_module._sanitize_headers_for_logging(
@@ -453,6 +545,18 @@ class TestPyWencaiHelpers(unittest.TestCase):
             wencai_module._connection_retry_backoff_seconds(3, 0.8),
             0.8,
         )
+
+    def test_loop_page_returns_empty_frame_for_zero_row_count(self):
+        with patch.object(wencai_module, "get_page", side_effect=AssertionError("should not fetch pages")):
+            result = wencai_module.loop_page(
+                True,
+                0,
+                {"question": "测试"},
+                question="测试",
+            )
+
+        self.assertIsInstance(result, pd.DataFrame)
+        self.assertTrue(result.empty)
 
     def test_convert_parses_robot_fixture(self):
         response = Mock()

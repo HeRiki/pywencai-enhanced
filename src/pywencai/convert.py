@@ -3,6 +3,7 @@ import json
 import pydash as _
 import requests as rq
 import logging
+import re
 from urllib.parse import urlparse, parse_qs
 from .headers import headers
 
@@ -217,25 +218,119 @@ show_type_handler_dict = {
 }
 
 
-def get_show_type_handler(show_type):
-    if show_type not in show_type_handler_dict and show_type:
+show_type_handler_alias_dict = {
+    'txt': 'txt1',
+    'list': 'common',
+    'line': 'common',
+    'bar': 'common',
+    'kline': 'common',
+}
+
+
+def _resolve_special_handler_key_from_structure(comp):
+    if not isinstance(comp, dict):
+        return None
+
+    children = _.get(comp, 'config.children')
+    if isinstance(children, list):
+        return 'container'
+
+    tab_list = comp.get('tab_list')
+    if isinstance(tab_list, list):
+        if isinstance(comp.get('data'), dict):
+            for _tab_name, current_tab_list in _iter_tab_items(comp):
+                for tab_comp in current_tab_list:
+                    if isinstance(tab_comp, dict) and tab_comp.get('data_index') is not None:
+                        return 'tab1'
+        return 'tab4'
+
+    sub_blocks = _.get(comp, 'data.result.subBlocks')
+    if isinstance(sub_blocks, list):
+        return 'nestedblocks'
+
+    if _.get(comp, 'data.result.data') is not None:
+        return 'textblocklinkone'
+
+    first_data = _.get(comp, 'data.datas.0')
+    if isinstance(first_data, dict) and 'detail' in first_data:
+        detail = first_data.get('detail')
+        if detail is None or isinstance(detail, list):
+            return 'dragon_tiger_stock'
+
+    content = _.get(comp, 'data.content')
+    if content is not None and not isinstance(content, (dict, list)):
+        return 'txt1'
+
+    return None
+
+
+def _can_use_common_handler_from_structure(comp):
+    return isinstance(comp, dict) and 'data' in comp
+
+
+def _describe_component_shape(comp):
+    if not isinstance(comp, dict):
+        return f'type={type(comp).__name__}'
+
+    top_keys = sorted(comp.keys())
+    data_value = comp.get('data')
+    data_keys = sorted(data_value.keys()) if isinstance(data_value, dict) else []
+    return (
+        f'top_keys={top_keys}, '
+        f'has_data={"data" in comp}, '
+        f'data_type={type(data_value).__name__ if data_value is not None else "None"}, '
+        f'data_keys={data_keys}, '
+        f'has_tab_list={isinstance(comp.get("tab_list"), list)}, '
+        f'has_children={isinstance(_.get(comp, "config.children"), list)}'
+    )
+
+
+def _resolve_show_type_key(show_type):
+    if not show_type:
+        return None
+    if show_type in show_type_handler_dict:
+        return show_type
+
+    base_show_type = re.sub(r'\d+$', '', str(show_type))
+    if base_show_type in show_type_handler_dict:
+        return base_show_type
+
+    alias_show_type = show_type_handler_alias_dict.get(base_show_type)
+    if alias_show_type in show_type_handler_dict:
+        return alias_show_type
+
+    return None
+
+
+def get_show_type_handler(show_type, comp=None):
+    resolved_show_type = _resolve_special_handler_key_from_structure(comp)
+    if resolved_show_type is None:
+        resolved_show_type = _resolve_show_type_key(show_type)
+    if resolved_show_type is not None:
+        return show_type_handler_dict[resolved_show_type]
+    if _can_use_common_handler_from_structure(comp):
+        return common_handler
+
+    if show_type:
         UNKNOWN_SHOW_TYPE_COUNTS[show_type] = UNKNOWN_SHOW_TYPE_COUNTS.get(show_type, 0) + 1
         count = UNKNOWN_SHOW_TYPE_COUNTS[show_type]
         if count == 1:
             logger.warning(
-                f'未识别的show_type，回退common_handler并静默后续重复日志: show_type={show_type}'
+                '未识别且无法按结构解析的show_type，回退common_handler并静默后续重复日志: '
+                f'show_type={show_type}, shape={_describe_component_shape(comp)}'
             )
         else:
             logger.debug(
-                f'未识别的show_type重复出现，继续回退common_handler: show_type={show_type}, count={count}'
+                '未识别且无法按结构解析的show_type重复出现，继续回退common_handler: '
+                f'show_type={show_type}, count={count}, shape={_describe_component_shape(comp)}'
             )
-    return show_type_handler_dict.get(show_type, common_handler)
+    return common_handler
 
 
 def show_type_handler(comp, comps):
     '''处理每种不同的show_type类型'''
     show_type = comp.get('show_type')
-    handler = get_show_type_handler(show_type)
+    handler = get_show_type_handler(show_type, comp=comp)
     return handler(comp, comps)
 
 def get_key(comp):

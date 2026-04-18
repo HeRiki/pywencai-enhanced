@@ -616,6 +616,8 @@ def loop_page(loop, row_count, url_params, **kwargs):
     count = 0
     perpage = kwargs.pop('perpage', 100)
     max_page = math.ceil(row_count / perpage)
+    if max_page <= 0:
+        return pd.DataFrame()
     result = None
     if 'page' not in kwargs:
         kwargs['page'] = 1
@@ -667,6 +669,9 @@ def _fetch_result_dataframe(params, loop=False, log=False, **kwargs):
         if loop and find is None:
             row_count = params.get('row_count', 0)
             log and logger.info(f'开始循环分页，总条数: {row_count}')
+            if not row_count:
+                log and logger.info('循环分页总条数为0，直接返回空DataFrame')
+                return pd.DataFrame()
             result = loop_page(loop, row_count, url_params, **page_kwargs)
             log and logger.info(f'循环分页完成，返回结果形状: {result.shape if result is not None else "None"}')
             return result
