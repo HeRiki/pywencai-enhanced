@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pywencai-enhanced"
-version = "0.1.0"
+version = "0.1.1"
 description = "Enhanced fork of pywencai with stronger auth refresh, retries, and parsing."
 readme = "README.md"
 requires-python = ">=3.10"

@@ -37,7 +37,7 @@ pip install git+https://github.com/HeRiki/pywencai-enhanced.git
 按 tag 安装指定版本：
 
 ```bash
-pip install git+https://github.com/HeRiki/pywencai-enhanced.git@v0.1.0
+pip install git+https://github.com/HeRiki/pywencai-enhanced.git@v0.1.1
 ```
 
 本地开发安装：
