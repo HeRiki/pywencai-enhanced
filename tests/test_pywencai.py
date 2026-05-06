@@ -72,6 +72,20 @@ class TestPyWencaiHelpers(unittest.TestCase):
         self.assertIn("示例", result)
         self.assertEqual(list(result["示例"].keys()), ["common"])
 
+    def test_nested_get_url_ignores_environment_proxy(self):
+        response = Mock()
+        response.text = '{"data":{"股票代码":"600001"}}'
+        response.raise_for_status = Mock()
+        session = Mock()
+        session.request.return_value = response
+
+        with patch.object(convert_module.rq, "Session", return_value=session):
+            result = convert_module.get_url("/gateway/test")
+
+        self.assertEqual(result, {"股票代码": "600001"})
+        self.assertFalse(session.trust_env)
+        session.close.assert_called_once()
+
     def test_get_show_type_handler_falls_back_to_common_handler(self):
         convert_module.UNKNOWN_SHOW_TYPE_COUNTS.clear()
         handler = convert_module.get_show_type_handler("unknown_type")
@@ -234,6 +248,7 @@ class TestPyWencaiHelpers(unittest.TestCase):
         self.assertIs(first, fake_session)
         self.assertIs(second, fake_session)
         self.assertEqual(mock_session.call_count, 1)
+        self.assertFalse(fake_session.trust_env)
 
     def test_get_page_rejects_non_list_data_list(self):
         response = Mock()

@@ -47,6 +47,7 @@ def get_session():
     global _SESSION
     if _SESSION is None:
         _SESSION = rq.Session()
+        _SESSION.trust_env = False
         _SESSION.headers.update({"Connection": "keep-alive"})
     return _SESSION
 

@@ -47,6 +47,15 @@ def _response_snippet(text, limit=500):
     return value[:limit]
 
 
+def _request_without_env_proxy(**kwargs):
+    session = rq.Session()
+    session.trust_env = False
+    try:
+        return session.request(**kwargs)
+    finally:
+        session.close()
+
+
 def _extract_root_payload(result):
     if not isinstance(result, dict):
         raise ConvertMissingDataError(f'响应顶层不是字典类型: type={type(result).__name__}')
@@ -80,7 +89,7 @@ def get_url(url, depth=0, max_depth=DEFAULT_NESTED_MAX_DEPTH):
         logger.warning(f'获取嵌套问财数据已达到最大深度: url={url}, depth={depth}, max_depth={max_depth}')
         return None
     try:
-        res = rq.request(
+        res = _request_without_env_proxy(
             method='GET',
             url=f'https://www.iwencai.com{url}',
             headers=headers(),
