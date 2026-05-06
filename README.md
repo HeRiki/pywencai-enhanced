@@ -37,7 +37,7 @@ pip install git+https://github.com/HeRiki/pywencai-enhanced.git
 Install a tagged release:
 
 ```bash
-pip install git+https://github.com/HeRiki/pywencai-enhanced.git@v0.1.1
+pip install git+https://github.com/HeRiki/pywencai-enhanced.git@v0.1.2
 ```
 
 For local development:
