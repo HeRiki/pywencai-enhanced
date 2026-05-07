@@ -164,6 +164,7 @@ def get_url(url, request_context=None, depth=0, max_depth=DEFAULT_NESTED_MAX_DEP
             user_agent=user_agent,
             request_params=request_params,
             force_refresh_token=force_refresh_token,
+            refresh_reason=refresh_reason,
         )
         if log:
             logger.debug(
@@ -188,13 +189,13 @@ def get_url(url, request_context=None, depth=0, max_depth=DEFAULT_NESTED_MAX_DEP
             log and logger.warning(f"获取嵌套问财数据失败: url={url}, error={exc}")
             return None
         try:
-            return send(force_refresh_token=True, refresh_reason="auth_error")
+            return send(force_refresh_token=True, refresh_reason="nested.auth_error")
         except Exception as retry_exc:  # pragma: no cover - 次级失败路径
             log and logger.warning(f"获取嵌套问财数据失败: url={url}, error={retry_exc}")
             return None
     except (ConvertError, rq.exceptions.RequestException) as exc:
         try:
-            return send(force_refresh_token=True, refresh_reason="parse_error")
+            return send(force_refresh_token=True, refresh_reason="nested.parse_error")
         except Exception:
             log and logger.warning(f"获取嵌套问财数据失败: url={url}, error={exc}")
             return None

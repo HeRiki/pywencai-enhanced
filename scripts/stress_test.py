@@ -38,60 +38,6 @@ class PhaseConfig:
     concurrency: int
 
 
-class RuntimeInstrumentation:
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self.token_total_calls = 0
-        self.token_force_refresh_calls = 0
-        self.token_bucket_labels: Counter[str] = Counter()
-        self.session_reset_calls = 0
-        self._orig_get_token = None
-        self._orig_reset_runtime_http_state = None
-
-    def install(self) -> None:
-        if self._orig_get_token is not None:
-            return
-
-        self._orig_get_token = headers_module.get_token
-        self._orig_reset_runtime_http_state = wencai_module.reset_runtime_http_state
-
-        def wrapped_get_token(*args, **kwargs):
-            force_refresh = bool(kwargs.get("force_refresh", False))
-            bucket_key = kwargs.get("bucket_key")
-            bucket_label = headers_module.format_token_bucket_label(bucket_key)
-            with self._lock:
-                self.token_total_calls += 1
-                if force_refresh:
-                    self.token_force_refresh_calls += 1
-                self.token_bucket_labels[bucket_label] += 1
-            return self._orig_get_token(*args, **kwargs)
-
-        def wrapped_reset_runtime_http_state(*args, **kwargs):
-            with self._lock:
-                self.session_reset_calls += 1
-            return self._orig_reset_runtime_http_state(*args, **kwargs)
-
-        headers_module.get_token = wrapped_get_token
-        wencai_module.reset_runtime_http_state = wrapped_reset_runtime_http_state
-
-    def uninstall(self) -> None:
-        if self._orig_get_token is not None:
-            headers_module.get_token = self._orig_get_token
-            self._orig_get_token = None
-        if self._orig_reset_runtime_http_state is not None:
-            wencai_module.reset_runtime_http_state = self._orig_reset_runtime_http_state
-            self._orig_reset_runtime_http_state = None
-
-    def snapshot(self) -> Dict[str, Any]:
-        with self._lock:
-            return {
-                "token_total_calls": self.token_total_calls,
-                "token_force_refresh_calls": self.token_force_refresh_calls,
-                "token_bucket_labels": dict(self.token_bucket_labels),
-                "session_reset_calls": self.session_reset_calls,
-            }
-
-
 def _parse_phase(raw: str) -> PhaseConfig:
     parts = [segment.strip() for segment in raw.split(":")]
     if len(parts) != 4:
@@ -192,6 +138,12 @@ def _classify_exception(exc: BaseException) -> Dict[str, Any]:
     }
 
 
+def _counter_delta(after: Dict[str, int], before: Dict[str, int]) -> Dict[str, int]:
+    delta = Counter(after or {})
+    delta.subtract(Counter(before or {}))
+    return {key: int(value) for key, value in delta.items() if value}
+
+
 def _exercise_request(
     *,
     query: str,
@@ -240,8 +192,8 @@ def _summarize_phase(
     phase: PhaseConfig,
     results: List[Dict[str, Any]],
     wall_seconds: float,
-    instrumentation_before: Dict[str, Any],
-    instrumentation_after: Dict[str, Any],
+    metrics_before: Dict[str, Any],
+    metrics_after: Dict[str, Any],
 ) -> Dict[str, Any]:
     total = len(results)
     successes = [item for item in results if item["ok"]]
@@ -256,9 +208,10 @@ def _summarize_phase(
     )
     error_counts = Counter(item.get("error_type", "unknown") for item in failures)
 
-    before_buckets = Counter(instrumentation_before["token_bucket_labels"])
-    after_buckets = Counter(instrumentation_after["token_bucket_labels"])
-    bucket_delta = dict(after_buckets - before_buckets)
+    bucket_delta = _counter_delta(
+        metrics_after["token_bucket_usage"],
+        metrics_before["token_bucket_usage"],
+    )
 
     return {
         "phase": phase.name,
@@ -282,14 +235,26 @@ def _summarize_phase(
         },
         "http_status_counts": dict(status_counts),
         "error_counts": dict(error_counts),
-        "token_calls": instrumentation_after["token_total_calls"] - instrumentation_before["token_total_calls"],
+        "token_calls": metrics_after["token_total_calls"] - metrics_before["token_total_calls"],
+        "token_cache_hits": metrics_after["token_cache_hits"] - metrics_before["token_cache_hits"],
         "token_force_refresh_calls": (
-            instrumentation_after["token_force_refresh_calls"]
-            - instrumentation_before["token_force_refresh_calls"]
+            metrics_after["token_force_refresh_calls"]
+            - metrics_before["token_force_refresh_calls"]
+        ),
+        "token_force_refresh_reasons": _counter_delta(
+            metrics_after["token_force_refresh_reasons"],
+            metrics_before["token_force_refresh_reasons"],
+        ),
+        "token_generation_modes": _counter_delta(
+            metrics_after["token_generation_modes"],
+            metrics_before["token_generation_modes"],
         ),
         "session_reset_calls": (
-            instrumentation_after["session_reset_calls"]
-            - instrumentation_before["session_reset_calls"]
+            metrics_after["session_reset_calls"] - metrics_before["session_reset_calls"]
+        ),
+        "session_reset_reasons": _counter_delta(
+            metrics_after["session_reset_reasons"],
+            metrics_before["session_reset_reasons"],
         ),
         "token_bucket_usage": bucket_delta,
     }
@@ -305,11 +270,10 @@ def _run_phase(
     strict: bool,
     loop: bool,
     request_params: Dict[str, Any],
-    instrumentation: RuntimeInstrumentation,
 ) -> Dict[str, Any]:
     interval = 1.0 / phase.rate
     semaphore = threading.Semaphore(phase.concurrency)
-    instrumentation_before = instrumentation.snapshot()
+    metrics_before = headers_module.get_runtime_metrics()
     results: List[Dict[str, Any]] = []
     started = time.perf_counter()
 
@@ -348,13 +312,13 @@ def _run_phase(
             results.append(future.result())
 
     wall_seconds = time.perf_counter() - started
-    instrumentation_after = instrumentation.snapshot()
+    metrics_after = headers_module.get_runtime_metrics()
     return _summarize_phase(
         phase=phase,
         results=results,
         wall_seconds=wall_seconds,
-        instrumentation_before=instrumentation_before,
-        instrumentation_after=instrumentation_after,
+        metrics_before=metrics_before,
+        metrics_after=metrics_after,
     )
 
 
@@ -373,10 +337,20 @@ def _build_report(
         "success_empty": sum(int(item["success_empty"]) for item in phase_list),
         "failures": sum(int(item["failures"]) for item in phase_list),
         "token_calls": sum(int(item["token_calls"]) for item in phase_list),
+        "token_cache_hits": sum(int(item["token_cache_hits"]) for item in phase_list),
         "token_force_refresh_calls": sum(int(item["token_force_refresh_calls"]) for item in phase_list),
         "session_reset_calls": sum(int(item["session_reset_calls"]) for item in phase_list),
         "http_status_counts": dict(sum((Counter(item["http_status_counts"]) for item in phase_list), Counter())),
         "error_counts": dict(sum((Counter(item["error_counts"]) for item in phase_list), Counter())),
+        "token_force_refresh_reasons": dict(
+            sum((Counter(item["token_force_refresh_reasons"]) for item in phase_list), Counter())
+        ),
+        "token_generation_modes": dict(
+            sum((Counter(item["token_generation_modes"]) for item in phase_list), Counter())
+        ),
+        "session_reset_reasons": dict(
+            sum((Counter(item["session_reset_reasons"]) for item in phase_list), Counter())
+        ),
     }
     total = aggregated["scheduled_requests"]
     total_successes = aggregated["success_non_empty"] + aggregated["success_empty"]
@@ -426,10 +400,9 @@ def main() -> int:
     phases = args.phase or _default_phases()
     request_params: Dict[str, Any] = {}
 
-    instrumentation = RuntimeInstrumentation()
-    instrumentation.install()
     pywencai.reset_logger()
     headers_module.clear_runtime_cache()
+    headers_module.clear_runtime_metrics()
     wencai_module.clear_runtime_state()
 
     try:
@@ -450,7 +423,6 @@ def main() -> int:
                     strict=args.strict,
                     loop=args.loop,
                     request_params=request_params,
-                    instrumentation=instrumentation,
                 )
             )
         report = _build_report(
@@ -461,7 +433,6 @@ def main() -> int:
             loop=args.loop,
         )
     finally:
-        instrumentation.uninstall()
         wencai_module.clear_runtime_state()
 
     report_text = json.dumps(report, ensure_ascii=False, indent=2)

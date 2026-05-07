@@ -4,7 +4,9 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
+from collections import Counter
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import quote
 
@@ -23,6 +25,17 @@ TOKEN_CACHE_MAX_BUCKETS = 32
 _NODE_AVAILABLE_CACHE: Optional[Tuple[bool, Optional[str]]] = None
 _TOKEN_CACHE: Dict[str, Dict[str, Any]] = {}
 _USER_AGENT_CACHE = {"value": None}
+_RUNTIME_METRICS_LOCK = threading.Lock()
+_RUNTIME_METRICS = {
+    "token_total_calls": 0,
+    "token_cache_hits": 0,
+    "token_force_refresh_calls": 0,
+    "token_force_refresh_reasons": Counter(),
+    "token_generation_modes": Counter(),
+    "token_bucket_usage": Counter(),
+    "session_reset_calls": 0,
+    "session_reset_reasons": Counter(),
+}
 
 
 def write_log(message, level="INFO"):
@@ -46,6 +59,63 @@ def clear_runtime_cache():
     _NODE_AVAILABLE_CACHE = None
     _TOKEN_CACHE.clear()
     _USER_AGENT_CACHE["value"] = None
+
+
+def clear_runtime_metrics():
+    """清理运行时遥测计数。"""
+    with _RUNTIME_METRICS_LOCK:
+        _RUNTIME_METRICS["token_total_calls"] = 0
+        _RUNTIME_METRICS["token_cache_hits"] = 0
+        _RUNTIME_METRICS["token_force_refresh_calls"] = 0
+        _RUNTIME_METRICS["token_force_refresh_reasons"].clear()
+        _RUNTIME_METRICS["token_generation_modes"].clear()
+        _RUNTIME_METRICS["token_bucket_usage"].clear()
+        _RUNTIME_METRICS["session_reset_calls"] = 0
+        _RUNTIME_METRICS["session_reset_reasons"].clear()
+
+
+def get_runtime_metrics():
+    """获取当前进程内的运行时遥测快照。"""
+    with _RUNTIME_METRICS_LOCK:
+        return {
+            "token_total_calls": int(_RUNTIME_METRICS["token_total_calls"]),
+            "token_cache_hits": int(_RUNTIME_METRICS["token_cache_hits"]),
+            "token_force_refresh_calls": int(_RUNTIME_METRICS["token_force_refresh_calls"]),
+            "token_force_refresh_reasons": dict(_RUNTIME_METRICS["token_force_refresh_reasons"]),
+            "token_generation_modes": dict(_RUNTIME_METRICS["token_generation_modes"]),
+            "token_bucket_usage": dict(_RUNTIME_METRICS["token_bucket_usage"]),
+            "session_reset_calls": int(_RUNTIME_METRICS["session_reset_calls"]),
+            "session_reset_reasons": dict(_RUNTIME_METRICS["session_reset_reasons"]),
+        }
+
+
+def _record_token_event(
+    *,
+    bucket_key=None,
+    total_call=False,
+    cache_hit=False,
+    force_refresh=False,
+    refresh_reason=None,
+    generation_mode=None,
+):
+    bucket_label = format_token_bucket_label(bucket_key)
+    with _RUNTIME_METRICS_LOCK:
+        if total_call:
+            _RUNTIME_METRICS["token_total_calls"] += 1
+            _RUNTIME_METRICS["token_bucket_usage"][bucket_label] += 1
+        if cache_hit:
+            _RUNTIME_METRICS["token_cache_hits"] += 1
+        if force_refresh:
+            _RUNTIME_METRICS["token_force_refresh_calls"] += 1
+            _RUNTIME_METRICS["token_force_refresh_reasons"][str(refresh_reason or "unspecified")] += 1
+        if generation_mode:
+            _RUNTIME_METRICS["token_generation_modes"][str(generation_mode)] += 1
+
+
+def record_session_reset(reason=None):
+    with _RUNTIME_METRICS_LOCK:
+        _RUNTIME_METRICS["session_reset_calls"] += 1
+        _RUNTIME_METRICS["session_reset_reasons"][str(reason or "unspecified")] += 1
 
 
 def find_packed_node():
@@ -274,6 +344,7 @@ def get_token(
     force_refresh=False,
     ttl_seconds=TOKEN_CACHE_TTL_SECONDS,
     bucket_key=None,
+    refresh_reason=None,
 ):
     """获取 token。"""
     now = time.time()
@@ -283,9 +354,24 @@ def get_token(
         request_params=None,
     )
     _purge_expired_token_buckets(now)
+    _record_token_event(
+        bucket_key=resolved_bucket_key,
+        total_call=True,
+    )
+    if force_refresh:
+        _record_token_event(
+            bucket_key=resolved_bucket_key,
+            force_refresh=True,
+            refresh_reason=refresh_reason,
+        )
     if not force_refresh:
         cached_token = _get_cached_token(resolved_bucket_key, now)
         if cached_token:
+            _record_token_event(
+                bucket_key=resolved_bucket_key,
+                cache_hit=True,
+                generation_mode="cache_hit",
+            )
             logger.debug(
                 f"命中token缓存: bucket={format_token_bucket_label(resolved_bucket_key)}, "
                 f"ttl_remaining={float(_TOKEN_CACHE[resolved_bucket_key]['expires_at']) - now:.2f}"
@@ -313,6 +399,10 @@ def get_token(
                     f"bucket={format_token_bucket_label(resolved_bucket_key)}"
                 )
                 _set_cached_token(resolved_bucket_key, bundle_token, now + ttl_seconds)
+                _record_token_event(
+                    bucket_key=resolved_bucket_key,
+                    generation_mode="node_bundle",
+                )
                 return bundle_token
 
             logger.error(f"使用hexin-v.bundle.js生成token失败: {result.stderr}")
@@ -331,6 +421,10 @@ def get_token(
                     f"bucket={format_token_bucket_label(resolved_bucket_key)}"
                 )
                 _set_cached_token(resolved_bucket_key, node_token, now + ttl_seconds)
+                _record_token_event(
+                    bucket_key=resolved_bucket_key,
+                    generation_mode="node_script",
+                )
                 return node_token
 
             logger.error(f"使用hexin-v.js生成token失败: {result.stderr}")
@@ -345,10 +439,18 @@ def get_token(
                 f"bucket={format_token_bucket_label(resolved_bucket_key)}"
             )
             _set_cached_token(resolved_bucket_key, python_token, now + ttl_seconds)
+            _record_token_event(
+                bucket_key=resolved_bucket_key,
+                generation_mode="python",
+            )
             return python_token
 
         logger.error("所有token生成方式失败，使用默认token")
         logger.error("建议安装Node.js以获取有效token，否则可能无法获取数据")
+        _record_token_event(
+            bucket_key=resolved_bucket_key,
+            generation_mode="default_token",
+        )
         return "default-token"
     except Exception as exc:  # pragma: no cover - 外部环境相关
         logger.error(f"获取token时发生异常: {exc}")
@@ -357,9 +459,17 @@ def get_token(
             fallback_token = generate_token_python()
             logger.debug(f"使用fallback token: {fallback_token[:10]}...")
             _set_cached_token(resolved_bucket_key, fallback_token, now + ttl_seconds)
+            _record_token_event(
+                bucket_key=resolved_bucket_key,
+                generation_mode="python_fallback_after_exception",
+            )
             return fallback_token
         except Exception:  # pragma: no cover - 极端兜底
             logger.error("fallback token生成失败")
+            _record_token_event(
+                bucket_key=resolved_bucket_key,
+                generation_mode="default_token_after_exception",
+            )
             return "default-token"
 
 
@@ -368,6 +478,7 @@ def build_auth_headers(
     user_agent=None,
     request_params=None,
     force_refresh_token=False,
+    refresh_reason=None,
 ):
     """
     生成认证请求头，并返回对应的 token bucket key。
@@ -387,6 +498,7 @@ def build_auth_headers(
             "hexin-v": get_token(
                 force_refresh=force_refresh_token,
                 bucket_key=bucket_key,
+                refresh_reason=refresh_reason,
             ),
             "User-Agent": resolved_user_agent,
             "cookie": sanitized_cookie,
@@ -413,6 +525,7 @@ def build_request_headers(
     request_params=None,
     extra_headers=None,
     force_refresh_token=False,
+    refresh_reason=None,
 ):
     """
     构造完整请求头，并返回对应的 token bucket key。
@@ -425,6 +538,7 @@ def build_request_headers(
         user_agent=user_agent,
         request_params=request_params,
         force_refresh_token=force_refresh_token,
+        refresh_reason=refresh_reason,
     )
     req_headers.update(
         {

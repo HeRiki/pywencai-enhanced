@@ -13,7 +13,7 @@ import requests as rq
 from . import convert as convert_module
 from . import headers as headers_module
 from .convert import ConvertError, ConvertHttpError, convert
-from .headers import build_request_headers, format_token_bucket_label
+from .headers import build_request_headers, format_token_bucket_label, record_session_reset
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -58,8 +58,9 @@ def clear_runtime_state():
         _SESSION = None
 
 
-def reset_runtime_http_state():
+def reset_runtime_http_state(reason=None):
     """丢弃当前进程内复用的 HTTP 会话，避免在鉴权失败后复用脏状态。"""
+    record_session_reset(reason=reason)
     clear_runtime_state()
 
 
@@ -138,6 +139,7 @@ def _build_runtime_headers(
     request_params=None,
     extra_headers=None,
     force_refresh_token=False,
+    refresh_reason=None,
 ):
     return build_request_headers(
         question=question,
@@ -147,6 +149,7 @@ def _build_runtime_headers(
         request_params=request_params,
         extra_headers=extra_headers,
         force_refresh_token=force_refresh_token,
+        refresh_reason=refresh_reason,
     )
 
 
@@ -301,7 +304,7 @@ def while_do(do, retry=10, sleep=0, log=False, raise_last_exception=False):
                 retry_count=retry,
                 attempt=attempt + 1,
             )
-            reset_runtime_http_state()
+            reset_runtime_http_state(reason="retry.connection_error")
         except rq.exceptions.HTTPError as exc:
             last_exception = exc
             status_code = getattr(getattr(exc, "response", None), "status_code", None)
@@ -370,10 +373,12 @@ def _convert_robot_response_with_retry(
     try:
         return convert(response, raise_on_error=True, request_context=request_context)
     except ConvertError:
+        refresh_reason = "robot.parse_error"
         log and _log_with_context(
             "warning",
             "get-robot-data首次解析失败，强制刷新token后重试一次",
             **request_context,
+            refresh_reason=refresh_reason,
         )
         refreshed_headers, refreshed_bucket_key = _build_runtime_headers(
             question,
@@ -382,10 +387,12 @@ def _convert_robot_response_with_retry(
             user_agent=user_agent,
             request_params=request_params,
             force_refresh_token=True,
+            refresh_reason=refresh_reason,
         )
         refreshed_context = {
             **request_context,
             "token_refresh": "forced",
+            "refresh_reason": refresh_reason,
             "bucket": format_token_bucket_label(refreshed_bucket_key),
         }
         log and logger.debug(
@@ -472,9 +479,10 @@ def get_robot_data(**kwargs):
                     "warning",
                     "get-robot-data首次鉴权失败，强制刷新token后重试一次",
                     **request_context,
+                    refresh_reason="robot.auth_error",
                     status_code=getattr(getattr(exc, "response", None), "status_code", None),
                 )
-                reset_runtime_http_state()
+                reset_runtime_http_state(reason="robot.auth_error")
                 refreshed_headers, refreshed_bucket_key = _build_runtime_headers(
                     question,
                     query_type=query_type,
@@ -482,6 +490,7 @@ def get_robot_data(**kwargs):
                     user_agent=user_agent,
                     request_params=request_params,
                     force_refresh_token=True,
+                    refresh_reason="robot.auth_error",
                 )
                 refreshed_context = {
                     **request_context,
@@ -630,9 +639,10 @@ def get_page(url_params, **kwargs):
                     "warning",
                     "分页请求首次鉴权失败，强制刷新token后重试一次",
                     **request_context,
+                    refresh_reason="page.auth_error",
                     status_code=getattr(getattr(exc, "response", None), "status_code", None),
                 )
-                reset_runtime_http_state()
+                reset_runtime_http_state(reason="page.auth_error")
                 refreshed_headers, refreshed_bucket_key = _build_runtime_headers(
                     question,
                     query_type=query_type,
@@ -640,6 +650,7 @@ def get_page(url_params, **kwargs):
                     user_agent=user_agent,
                     request_params=request_params,
                     force_refresh_token=True,
+                    refresh_reason="page.auth_error",
                 )
                 refreshed_context = {
                     **request_context,
@@ -668,6 +679,7 @@ def get_page(url_params, **kwargs):
                     "warning",
                     "分页请求首次解析失败，强制刷新token后重试一次",
                     **request_context,
+                    refresh_reason="page.parse_error",
                 )
                 refreshed_headers, refreshed_bucket_key = _build_runtime_headers(
                     question,
@@ -676,6 +688,7 @@ def get_page(url_params, **kwargs):
                     user_agent=user_agent,
                     request_params=request_params,
                     force_refresh_token=True,
+                    refresh_reason="page.parse_error",
                 )
                 refreshed_context = {
                     **request_context,

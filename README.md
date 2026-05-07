@@ -175,8 +175,9 @@ The script reports:
 - success vs. empty `DataFrame` vs. raised failures
 - latency percentiles
 - HTTP status distribution
-- token call / forced-refresh count
-- session reset count
+- token call / cache-hit / forced-refresh count
+- forced-refresh reasons and session-reset reasons
+- token generation mode distribution
 
 Do not commit real cookies or generated reports.
 

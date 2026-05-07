@@ -175,8 +175,9 @@ python scripts/stress_test.py \
 - 成功 / 空 `DataFrame` / 抛异常 的分布
 - 延迟分位数
 - HTTP 状态码分布
-- token 调用次数 / 强刷次数
-- session 重置次数
+- token 调用次数 / cache hit / 强刷次数
+- 强刷原因与 session 重置原因
+- token 生成方式分布
 
 不要把真实 cookie 或压测结果文件提交进仓库。
 
