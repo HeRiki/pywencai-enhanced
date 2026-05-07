@@ -16,6 +16,8 @@ from .convert import ConvertError, ConvertHttpError, convert
 from .headers import (
     allocate_request_id,
     build_request_headers,
+    CACHE_POLICY_BYPASS,
+    CACHE_POLICY_REUSE,
     format_token_bucket_label,
     record_request_event,
     record_session_reset,
@@ -170,6 +172,7 @@ def _build_runtime_headers(
     extra_headers=None,
     force_refresh_token=False,
     refresh_reason=None,
+    cache_policy=CACHE_POLICY_REUSE,
 ):
     return build_request_headers(
         question=question,
@@ -180,6 +183,7 @@ def _build_runtime_headers(
         extra_headers=extra_headers,
         force_refresh_token=force_refresh_token,
         refresh_reason=refresh_reason,
+        cache_policy=cache_policy,
     )
 
 
@@ -491,6 +495,7 @@ def _convert_robot_response_with_retry(
             request_params=request_params,
             force_refresh_token=True,
             refresh_reason=refresh_reason,
+            cache_policy=CACHE_POLICY_BYPASS,
         )
         refreshed_context = {
             **request_context,
@@ -576,6 +581,7 @@ def get_robot_data(**kwargs):
                 user_agent=user_agent,
                 request_params=request_params,
                 force_refresh_token=False,
+                cache_policy=CACHE_POLICY_BYPASS,
             )
             request_context["bucket"] = format_token_bucket_label(bucket_key)
             log and _log_with_context("info", "发送请求到get-robot-data", **request_context)
@@ -612,6 +618,7 @@ def get_robot_data(**kwargs):
                     request_params=request_params,
                     force_refresh_token=True,
                     refresh_reason="robot.auth_error",
+                    cache_policy=CACHE_POLICY_BYPASS,
                 )
                 refreshed_context = {
                     **request_context,
@@ -745,6 +752,7 @@ def get_page(url_params, **kwargs):
                 user_agent=user_agent,
                 request_params=request_params,
                 force_refresh_token=False,
+                cache_policy=CACHE_POLICY_REUSE,
             )
             request_context["bucket"] = format_token_bucket_label(bucket_key)
             try:
@@ -778,6 +786,7 @@ def get_page(url_params, **kwargs):
                     request_params=request_params,
                     force_refresh_token=True,
                     refresh_reason="page.auth_error",
+                    cache_policy=CACHE_POLICY_REUSE,
                 )
                 refreshed_context = {
                     **request_context,
@@ -825,6 +834,7 @@ def get_page(url_params, **kwargs):
                     request_params=request_params,
                     force_refresh_token=True,
                     refresh_reason="page.parse_error",
+                    cache_policy=CACHE_POLICY_REUSE,
                 )
                 refreshed_context = {
                     **request_context,

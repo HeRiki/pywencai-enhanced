@@ -265,6 +265,10 @@ def _summarize_phase(
             metrics_after["token_force_refresh_reasons"],
             metrics_before["token_force_refresh_reasons"],
         ),
+        "token_cache_policy_usage": _counter_delta(
+            metrics_after["token_cache_policy_usage"],
+            metrics_before["token_cache_policy_usage"],
+        ),
         "token_generation_modes": _counter_delta(
             metrics_after["token_generation_modes"],
             metrics_before["token_generation_modes"],
@@ -369,6 +373,9 @@ def _build_report(
         "session_reset_calls": sum(int(item["session_reset_calls"]) for item in phase_list),
         "http_status_counts": dict(sum((Counter(item["http_status_counts"]) for item in phase_list), Counter())),
         "error_counts": dict(sum((Counter(item["error_counts"]) for item in phase_list), Counter())),
+        "token_cache_policy_usage": dict(
+            sum((Counter(item["token_cache_policy_usage"]) for item in phase_list), Counter())
+        ),
         "token_force_refresh_reasons": dict(
             sum((Counter(item["token_force_refresh_reasons"]) for item in phase_list), Counter())
         ),

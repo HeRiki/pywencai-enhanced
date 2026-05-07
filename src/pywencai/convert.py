@@ -7,7 +7,13 @@ import pandas as pd
 import pydash as _
 import requests as rq
 
-from .headers import allocate_request_id, build_request_headers, format_token_bucket_label, record_request_event
+from .headers import (
+    CACHE_POLICY_REUSE,
+    allocate_request_id,
+    build_request_headers,
+    format_token_bucket_label,
+    record_request_event,
+)
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -199,6 +205,7 @@ def get_url(url, request_context=None, depth=0, max_depth=DEFAULT_NESTED_MAX_DEP
             request_params=request_params,
             force_refresh_token=force_refresh_token,
             refresh_reason=refresh_reason,
+            cache_policy=CACHE_POLICY_REUSE,
         )
         if log:
             logger.debug(

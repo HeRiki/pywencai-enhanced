@@ -176,10 +176,16 @@ The script reports:
 - latency percentiles
 - HTTP status distribution
 - token call / cache-hit / forced-refresh count
+- token cache policy usage (`reuse` vs `bypass`)
 - forced-refresh reasons and session-reset reasons
 - token generation mode distribution
 - initial vs. refresh request outcomes
 - bucket-level request outcome aggregation and recent request event samples
+
+Current default policy:
+
+- `get-robot-data` bypasses the token cache for both the initial request and auth retry
+- `page` and `nested` requests still use the normal cache reuse policy
 
 Do not commit real cookies or generated reports.
 

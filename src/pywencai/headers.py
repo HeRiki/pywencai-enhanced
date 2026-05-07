@@ -22,6 +22,8 @@ DEFAULT_USER_AGENT = (
 TOKEN_CACHE_TTL_SECONDS = 300
 TOKEN_CACHE_MAX_BUCKETS = 32
 RUNTIME_REQUEST_EVENT_LIMIT = 256
+CACHE_POLICY_REUSE = "reuse"
+CACHE_POLICY_BYPASS = "bypass"
 
 _NODE_AVAILABLE_CACHE: Optional[Tuple[bool, Optional[str]]] = None
 _TOKEN_CACHE: Dict[str, Dict[str, Any]] = {}
@@ -35,6 +37,7 @@ _RUNTIME_METRICS = {
     "token_force_refresh_reasons": Counter(),
     "token_generation_modes": Counter(),
     "token_bucket_usage": Counter(),
+    "token_cache_policy_usage": Counter(),
     "session_reset_calls": 0,
     "session_reset_reasons": Counter(),
     "request_event_total": 0,
@@ -80,6 +83,7 @@ def clear_runtime_metrics():
         _RUNTIME_METRICS["token_force_refresh_reasons"].clear()
         _RUNTIME_METRICS["token_generation_modes"].clear()
         _RUNTIME_METRICS["token_bucket_usage"].clear()
+        _RUNTIME_METRICS["token_cache_policy_usage"].clear()
         _RUNTIME_METRICS["session_reset_calls"] = 0
         _RUNTIME_METRICS["session_reset_reasons"].clear()
         _RUNTIME_METRICS["request_event_total"] = 0
@@ -100,6 +104,7 @@ def get_runtime_metrics():
             "token_force_refresh_reasons": dict(_RUNTIME_METRICS["token_force_refresh_reasons"]),
             "token_generation_modes": dict(_RUNTIME_METRICS["token_generation_modes"]),
             "token_bucket_usage": dict(_RUNTIME_METRICS["token_bucket_usage"]),
+            "token_cache_policy_usage": dict(_RUNTIME_METRICS["token_cache_policy_usage"]),
             "session_reset_calls": int(_RUNTIME_METRICS["session_reset_calls"]),
             "session_reset_reasons": dict(_RUNTIME_METRICS["session_reset_reasons"]),
             "request_event_total": int(_RUNTIME_METRICS["request_event_total"]),
@@ -139,12 +144,15 @@ def _record_token_event(
     force_refresh=False,
     refresh_reason=None,
     generation_mode=None,
+    cache_policy=None,
 ):
     bucket_label = format_token_bucket_label(bucket_key)
     with _RUNTIME_METRICS_LOCK:
         if total_call:
             _RUNTIME_METRICS["token_total_calls"] += 1
             _RUNTIME_METRICS["token_bucket_usage"][bucket_label] += 1
+            if cache_policy:
+                _RUNTIME_METRICS["token_cache_policy_usage"][str(cache_policy)] += 1
         if cache_hit:
             _RUNTIME_METRICS["token_cache_hits"] += 1
         if force_refresh:
@@ -441,8 +449,11 @@ def get_token(
     ttl_seconds=TOKEN_CACHE_TTL_SECONDS,
     bucket_key=None,
     refresh_reason=None,
+    cache_policy=CACHE_POLICY_REUSE,
 ):
     """获取 token。"""
+    if cache_policy not in {CACHE_POLICY_REUSE, CACHE_POLICY_BYPASS}:
+        raise ValueError(f"unsupported cache_policy: {cache_policy}")
     now = time.time()
     resolved_bucket_key = bucket_key or _build_token_bucket_key(
         cookie=None,
@@ -453,6 +464,7 @@ def get_token(
     _record_token_event(
         bucket_key=resolved_bucket_key,
         total_call=True,
+        cache_policy=cache_policy,
     )
     if force_refresh:
         _record_token_event(
@@ -460,7 +472,7 @@ def get_token(
             force_refresh=True,
             refresh_reason=refresh_reason,
         )
-    if not force_refresh:
+    if cache_policy == CACHE_POLICY_REUSE and not force_refresh:
         cached_token = _get_cached_token(resolved_bucket_key, now)
         if cached_token:
             _record_token_event(
@@ -494,7 +506,8 @@ def get_token(
                     f"成功使用Node.js bundle生成token: {bundle_token[:10]}..., "
                     f"bucket={format_token_bucket_label(resolved_bucket_key)}"
                 )
-                _set_cached_token(resolved_bucket_key, bundle_token, now + ttl_seconds)
+                if cache_policy == CACHE_POLICY_REUSE:
+                    _set_cached_token(resolved_bucket_key, bundle_token, now + ttl_seconds)
                 _record_token_event(
                     bucket_key=resolved_bucket_key,
                     generation_mode="node_bundle",
@@ -516,7 +529,8 @@ def get_token(
                     f"成功使用Node.js脚本生成token: {node_token[:10]}..., "
                     f"bucket={format_token_bucket_label(resolved_bucket_key)}"
                 )
-                _set_cached_token(resolved_bucket_key, node_token, now + ttl_seconds)
+                if cache_policy == CACHE_POLICY_REUSE:
+                    _set_cached_token(resolved_bucket_key, node_token, now + ttl_seconds)
                 _record_token_event(
                     bucket_key=resolved_bucket_key,
                     generation_mode="node_script",
@@ -534,7 +548,8 @@ def get_token(
                 f"使用Python生成的token: {python_token[:10]}..., "
                 f"bucket={format_token_bucket_label(resolved_bucket_key)}"
             )
-            _set_cached_token(resolved_bucket_key, python_token, now + ttl_seconds)
+            if cache_policy == CACHE_POLICY_REUSE:
+                _set_cached_token(resolved_bucket_key, python_token, now + ttl_seconds)
             _record_token_event(
                 bucket_key=resolved_bucket_key,
                 generation_mode="python",
@@ -554,7 +569,8 @@ def get_token(
         try:
             fallback_token = generate_token_python()
             logger.debug(f"使用fallback token: {fallback_token[:10]}...")
-            _set_cached_token(resolved_bucket_key, fallback_token, now + ttl_seconds)
+            if cache_policy == CACHE_POLICY_REUSE:
+                _set_cached_token(resolved_bucket_key, fallback_token, now + ttl_seconds)
             _record_token_event(
                 bucket_key=resolved_bucket_key,
                 generation_mode="python_fallback_after_exception",
@@ -575,6 +591,7 @@ def build_auth_headers(
     request_params=None,
     force_refresh_token=False,
     refresh_reason=None,
+    cache_policy=CACHE_POLICY_REUSE,
 ):
     """
     生成认证请求头，并返回对应的 token bucket key。
@@ -595,6 +612,7 @@ def build_auth_headers(
                 force_refresh=force_refresh_token,
                 bucket_key=bucket_key,
                 refresh_reason=refresh_reason,
+                cache_policy=cache_policy,
             ),
             "User-Agent": resolved_user_agent,
             "cookie": sanitized_cookie,
@@ -622,6 +640,7 @@ def build_request_headers(
     extra_headers=None,
     force_refresh_token=False,
     refresh_reason=None,
+    cache_policy=CACHE_POLICY_REUSE,
 ):
     """
     构造完整请求头，并返回对应的 token bucket key。
@@ -635,6 +654,7 @@ def build_request_headers(
         request_params=request_params,
         force_refresh_token=force_refresh_token,
         refresh_reason=refresh_reason,
+        cache_policy=cache_policy,
     )
     req_headers.update(
         {

@@ -251,6 +251,7 @@ class TestPyWencaiHelpers(unittest.TestCase):
 
         self.assertEqual(result, ({"hexin-v": "token-a"}, "bucket-a"))
         self.assertEqual(build_mock.call_args.kwargs["refresh_reason"], "robot.auth_error")
+        self.assertEqual(build_mock.call_args.kwargs["cache_policy"], headers_module.CACHE_POLICY_REUSE)
 
     def test_headers_cache_token_and_user_agent_within_same_bucket(self):
         fake_module = types.SimpleNamespace(UserAgent=lambda: types.SimpleNamespace(random="ua-fixed"))
@@ -311,6 +312,30 @@ class TestPyWencaiHelpers(unittest.TestCase):
         self.assertEqual(second["hexin-v"], "token-b")
         self.assertEqual(mock_token.call_count, 3)
 
+    def test_bypass_cache_policy_does_not_read_or_write_bucket_cache(self):
+        with patch.object(headers_module, "check_node_available", return_value=(False, None)):
+            with patch.object(
+                headers_module,
+                "generate_token_python",
+                side_effect=["token-a", "token-b"],
+            ) as mock_token:
+                first, bucket_a = headers_module.build_auth_headers(
+                    cookie="a=b",
+                    user_agent="ua-a",
+                    cache_policy=headers_module.CACHE_POLICY_BYPASS,
+                )
+                second, bucket_b = headers_module.build_auth_headers(
+                    cookie="a=b",
+                    user_agent="ua-a",
+                    cache_policy=headers_module.CACHE_POLICY_BYPASS,
+                )
+
+        self.assertEqual(bucket_a, bucket_b)
+        self.assertEqual(first["hexin-v"], "token-a")
+        self.assertEqual(second["hexin-v"], "token-b")
+        self.assertEqual(mock_token.call_count, 2)
+        self.assertEqual(headers_module._TOKEN_CACHE, {})
+
     def test_runtime_metrics_capture_force_refresh_reason_and_cache_hits(self):
         with patch.object(headers_module, "check_node_available", return_value=(False, None)):
             with patch.object(
@@ -336,6 +361,22 @@ class TestPyWencaiHelpers(unittest.TestCase):
         self.assertEqual(metrics["token_generation_modes"]["cache_hit"], 1)
         self.assertEqual(metrics["token_generation_modes"]["python"], 2)
         self.assertEqual(sum(metrics["token_bucket_usage"].values()), 3)
+        self.assertEqual(metrics["token_cache_policy_usage"]["reuse"], 3)
+
+    def test_runtime_metrics_capture_bypass_cache_policy_usage(self):
+        with patch.object(headers_module, "check_node_available", return_value=(False, None)):
+            with patch.object(headers_module, "generate_token_python", return_value="token-a"):
+                headers_module.build_auth_headers(
+                    cookie="a=b",
+                    user_agent="ua-a",
+                    cache_policy=headers_module.CACHE_POLICY_BYPASS,
+                )
+
+        metrics = headers_module.get_runtime_metrics()
+
+        self.assertEqual(metrics["token_cache_hits"], 0)
+        self.assertEqual(metrics["token_cache_policy_usage"]["bypass"], 1)
+        self.assertEqual(headers_module._TOKEN_CACHE, {})
 
     def test_runtime_metrics_capture_session_reset_reason(self):
         wencai_module.reset_runtime_http_state(reason="page.auth_error")
@@ -444,6 +485,8 @@ class TestPyWencaiHelpers(unittest.TestCase):
         self.assertEqual(headers_mock.call_args_list[0].kwargs["force_refresh_token"], False)
         self.assertEqual(headers_mock.call_args_list[1].kwargs["force_refresh_token"], True)
         self.assertEqual(headers_mock.call_args_list[1].kwargs["refresh_reason"], "page.parse_error")
+        self.assertEqual(headers_mock.call_args_list[0].kwargs["cache_policy"], headers_module.CACHE_POLICY_REUSE)
+        self.assertEqual(headers_mock.call_args_list[1].kwargs["cache_policy"], headers_module.CACHE_POLICY_REUSE)
         metrics = headers_module.get_runtime_metrics()
         self.assertEqual(metrics["request_outcomes"]["page.initial.success"], 1)
         self.assertEqual(metrics["request_outcomes"]["page.initial.parse_error"], 1)
@@ -485,6 +528,8 @@ class TestPyWencaiHelpers(unittest.TestCase):
         self.assertEqual(headers_mock.call_args_list[0].kwargs["force_refresh_token"], False)
         self.assertEqual(headers_mock.call_args_list[1].kwargs["force_refresh_token"], True)
         self.assertEqual(headers_mock.call_args_list[1].kwargs["refresh_reason"], "page.auth_error")
+        self.assertEqual(headers_mock.call_args_list[0].kwargs["cache_policy"], headers_module.CACHE_POLICY_REUSE)
+        self.assertEqual(headers_mock.call_args_list[1].kwargs["cache_policy"], headers_module.CACHE_POLICY_REUSE)
 
     def test_get_page_resets_session_after_403_response(self):
         auth_response = Mock()
@@ -539,6 +584,31 @@ class TestPyWencaiHelpers(unittest.TestCase):
         self.assertEqual(session.request.call_args.kwargs["url"], wencai_module.ROBOT_DATA_URL)
         self.assertTrue(session.request.call_args.kwargs["url"].startswith("https://"))
 
+    def test_get_robot_data_initial_request_bypasses_token_cache(self):
+        response = Mock()
+        response.text = self._read_fixture("robot_data_xuangu_table_v1.json")
+        response.raise_for_status = Mock()
+        response.status_code = 200
+        response.headers = {}
+        session = Mock()
+        session.request.return_value = response
+
+        with patch.object(wencai_module, "get_session", return_value=session):
+            with patch.object(
+                wencai_module,
+                "_build_runtime_headers",
+                return_value=({"hexin-v": "token-a", "User-Agent": "ua", "cookie": "a=b"}, "bucket-a"),
+            ) as headers_mock:
+                result = wencai_module.get_robot_data(
+                    query="十日涨幅前十",
+                    cookie="a=b",
+                    retry=1,
+                    log=False,
+                )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(headers_mock.call_args.kwargs["cache_policy"], headers_module.CACHE_POLICY_BYPASS)
+
     def test_get_robot_data_refreshes_token_after_401_response(self):
         auth_response = Mock()
         auth_response.status_code = 401
@@ -572,6 +642,8 @@ class TestPyWencaiHelpers(unittest.TestCase):
         self.assertEqual(headers_mock.call_args_list[0].kwargs["force_refresh_token"], False)
         self.assertEqual(headers_mock.call_args_list[1].kwargs["force_refresh_token"], True)
         self.assertEqual(headers_mock.call_args_list[1].kwargs["refresh_reason"], "robot.auth_error")
+        self.assertEqual(headers_mock.call_args_list[0].kwargs["cache_policy"], headers_module.CACHE_POLICY_BYPASS)
+        self.assertEqual(headers_mock.call_args_list[1].kwargs["cache_policy"], headers_module.CACHE_POLICY_BYPASS)
         metrics = headers_module.get_runtime_metrics()
         self.assertEqual(metrics["request_outcomes"]["robot.initial.http_401"], 1)
         self.assertEqual(metrics["request_outcomes"]["robot.refresh.success"], 1)

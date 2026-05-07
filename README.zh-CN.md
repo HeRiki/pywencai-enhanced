@@ -176,10 +176,16 @@ python scripts/stress_test.py \
 - 延迟分位数
 - HTTP 状态码分布
 - token 调用次数 / cache hit / 强刷次数
+- token cache policy 使用量（`reuse` / `bypass`）
 - 强刷原因与 session 重置原因
 - token 生成方式分布
 - 首包与强刷后请求的 outcome 分布
 - bucket 级别的请求 outcome 聚合与最近请求事件样本
+
+当前默认策略：
+
+- `get-robot-data` 的首包和鉴权重试都绕过 token cache
+- `page` 和 `nested` 请求暂时仍保留正常的 cache reuse 策略
 
 不要把真实 cookie 或压测结果文件提交进仓库。
 
