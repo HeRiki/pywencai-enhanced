@@ -209,6 +209,18 @@ class TestPyWencaiHelpers(unittest.TestCase):
         )
         self.assertEqual(context, "query=测试 | page=1 | query_type=stock")
 
+    def test_format_log_context_redacts_cookie_and_summarizes_request_params(self):
+        context = wencai_module._format_log_context(
+            query="测试",
+            cookie="a=b; c=d",
+            request_params={"proxies": {"https": "http://secret"}, "verify": False},
+        )
+
+        self.assertEqual(
+            context,
+            "query=测试 | cookie=<redacted> | request_params=proxies,verify",
+        )
+
     def test_normalize_get_kwargs_replaces_known_keys(self):
         normalized = wencai_module._normalize_get_kwargs(
             {"question": "测试", "sort_key": "a", "sort_order": "desc", "foo": "bar"}
@@ -333,6 +345,45 @@ class TestPyWencaiHelpers(unittest.TestCase):
         self.assertEqual(metrics["session_reset_calls"], 1)
         self.assertEqual(metrics["session_reset_reasons"]["page.auth_error"], 1)
 
+    def test_runtime_metrics_capture_request_outcomes_and_recent_events(self):
+        headers_module.record_request_event(
+            request_id="robot-000001",
+            target="robot",
+            attempt_stage="initial",
+            outcome="http_error",
+            status_code=403,
+            bucket_label="bucket-a",
+            query="测试",
+            query_type="stock",
+            url="https://www.iwencai.com/customized/chart/get-robot-data",
+        )
+        headers_module.record_request_event(
+            request_id="robot-000001",
+            target="robot",
+            attempt_stage="refresh",
+            outcome="success",
+            status_code=200,
+            bucket_label="bucket-a",
+            refresh_reason="robot.auth_error",
+            query="测试",
+            query_type="stock",
+            url="https://www.iwencai.com/customized/chart/get-robot-data",
+        )
+
+        metrics = headers_module.get_runtime_metrics()
+
+        self.assertEqual(metrics["request_event_total"], 2)
+        self.assertEqual(metrics["request_event_dropped"], 0)
+        self.assertEqual(metrics["request_outcomes"]["robot.initial.http_403"], 1)
+        self.assertEqual(metrics["request_outcomes"]["robot.refresh.success"], 1)
+        self.assertEqual(
+            metrics["request_outcomes_by_reason"]["robot.refresh.robot.auth_error.success"],
+            1,
+        )
+        bucket_key = "bucket-a|robot|refresh|robot.auth_error|success"
+        self.assertEqual(metrics["request_bucket_outcomes"][bucket_key], 1)
+        self.assertEqual(metrics["recent_request_events"][-1]["request_id"], "robot-000001")
+
     def test_get_session_reuses_singleton(self):
         fake_session = Mock()
         with patch.object(wencai_module.rq, "Session", return_value=fake_session) as mock_session:
@@ -393,6 +444,14 @@ class TestPyWencaiHelpers(unittest.TestCase):
         self.assertEqual(headers_mock.call_args_list[0].kwargs["force_refresh_token"], False)
         self.assertEqual(headers_mock.call_args_list[1].kwargs["force_refresh_token"], True)
         self.assertEqual(headers_mock.call_args_list[1].kwargs["refresh_reason"], "page.parse_error")
+        metrics = headers_module.get_runtime_metrics()
+        self.assertEqual(metrics["request_outcomes"]["page.initial.success"], 1)
+        self.assertEqual(metrics["request_outcomes"]["page.initial.parse_error"], 1)
+        self.assertEqual(metrics["request_outcomes"]["page.refresh.success"], 1)
+        self.assertEqual(
+            metrics["request_outcomes_by_reason"]["page.refresh.page.parse_error.success"],
+            1,
+        )
 
     def test_get_page_refreshes_token_after_401_response(self):
         auth_response = Mock()
@@ -513,6 +572,13 @@ class TestPyWencaiHelpers(unittest.TestCase):
         self.assertEqual(headers_mock.call_args_list[0].kwargs["force_refresh_token"], False)
         self.assertEqual(headers_mock.call_args_list[1].kwargs["force_refresh_token"], True)
         self.assertEqual(headers_mock.call_args_list[1].kwargs["refresh_reason"], "robot.auth_error")
+        metrics = headers_module.get_runtime_metrics()
+        self.assertEqual(metrics["request_outcomes"]["robot.initial.http_401"], 1)
+        self.assertEqual(metrics["request_outcomes"]["robot.refresh.success"], 1)
+        self.assertEqual(
+            metrics["request_outcomes_by_reason"]["robot.refresh.robot.auth_error.success"],
+            1,
+        )
 
     def test_get_robot_data_resets_session_after_403_response(self):
         auth_response = Mock()

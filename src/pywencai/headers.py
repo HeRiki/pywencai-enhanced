@@ -6,7 +6,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections import Counter
+from collections import Counter, deque
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import quote
 
@@ -21,10 +21,12 @@ DEFAULT_USER_AGENT = (
 )
 TOKEN_CACHE_TTL_SECONDS = 300
 TOKEN_CACHE_MAX_BUCKETS = 32
+RUNTIME_REQUEST_EVENT_LIMIT = 256
 
 _NODE_AVAILABLE_CACHE: Optional[Tuple[bool, Optional[str]]] = None
 _TOKEN_CACHE: Dict[str, Dict[str, Any]] = {}
 _USER_AGENT_CACHE = {"value": None}
+_RUNTIME_REQUEST_ID_SEQ = 0
 _RUNTIME_METRICS_LOCK = threading.Lock()
 _RUNTIME_METRICS = {
     "token_total_calls": 0,
@@ -35,6 +37,12 @@ _RUNTIME_METRICS = {
     "token_bucket_usage": Counter(),
     "session_reset_calls": 0,
     "session_reset_reasons": Counter(),
+    "request_event_total": 0,
+    "request_event_dropped": 0,
+    "request_outcomes": Counter(),
+    "request_outcomes_by_reason": Counter(),
+    "request_bucket_outcomes": Counter(),
+    "recent_request_events": deque(),
 }
 
 
@@ -63,7 +71,9 @@ def clear_runtime_cache():
 
 def clear_runtime_metrics():
     """清理运行时遥测计数。"""
+    global _RUNTIME_REQUEST_ID_SEQ
     with _RUNTIME_METRICS_LOCK:
+        _RUNTIME_REQUEST_ID_SEQ = 0
         _RUNTIME_METRICS["token_total_calls"] = 0
         _RUNTIME_METRICS["token_cache_hits"] = 0
         _RUNTIME_METRICS["token_force_refresh_calls"] = 0
@@ -72,6 +82,12 @@ def clear_runtime_metrics():
         _RUNTIME_METRICS["token_bucket_usage"].clear()
         _RUNTIME_METRICS["session_reset_calls"] = 0
         _RUNTIME_METRICS["session_reset_reasons"].clear()
+        _RUNTIME_METRICS["request_event_total"] = 0
+        _RUNTIME_METRICS["request_event_dropped"] = 0
+        _RUNTIME_METRICS["request_outcomes"].clear()
+        _RUNTIME_METRICS["request_outcomes_by_reason"].clear()
+        _RUNTIME_METRICS["request_bucket_outcomes"].clear()
+        _RUNTIME_METRICS["recent_request_events"].clear()
 
 
 def get_runtime_metrics():
@@ -86,7 +102,33 @@ def get_runtime_metrics():
             "token_bucket_usage": dict(_RUNTIME_METRICS["token_bucket_usage"]),
             "session_reset_calls": int(_RUNTIME_METRICS["session_reset_calls"]),
             "session_reset_reasons": dict(_RUNTIME_METRICS["session_reset_reasons"]),
+            "request_event_total": int(_RUNTIME_METRICS["request_event_total"]),
+            "request_event_dropped": int(_RUNTIME_METRICS["request_event_dropped"]),
+            "request_outcomes": dict(_RUNTIME_METRICS["request_outcomes"]),
+            "request_outcomes_by_reason": dict(_RUNTIME_METRICS["request_outcomes_by_reason"]),
+            "request_bucket_outcomes": dict(_RUNTIME_METRICS["request_bucket_outcomes"]),
+            "recent_request_events": list(_RUNTIME_METRICS["recent_request_events"]),
         }
+
+
+def _normalize_metric_label(value, default):
+    text = str(value or default).strip()
+    normalized = re.sub(r"[^0-9A-Za-z_.:-]+", "_", text)
+    return normalized or default
+
+
+def _runtime_outcome_label(outcome, status_code=None):
+    if outcome == "http_error" and status_code is not None:
+        return f"http_{status_code}"
+    return _normalize_metric_label(outcome, "unknown")
+
+
+def allocate_request_id(target=None):
+    global _RUNTIME_REQUEST_ID_SEQ
+    prefix = _normalize_metric_label(target, "req").lower()
+    with _RUNTIME_METRICS_LOCK:
+        _RUNTIME_REQUEST_ID_SEQ += 1
+        return f"{prefix}-{_RUNTIME_REQUEST_ID_SEQ:06d}"
 
 
 def _record_token_event(
@@ -116,6 +158,60 @@ def record_session_reset(reason=None):
     with _RUNTIME_METRICS_LOCK:
         _RUNTIME_METRICS["session_reset_calls"] += 1
         _RUNTIME_METRICS["session_reset_reasons"][str(reason or "unspecified")] += 1
+
+
+def record_request_event(
+    *,
+    request_id,
+    target,
+    attempt_stage,
+    outcome,
+    bucket_key=None,
+    bucket_label=None,
+    refresh_reason=None,
+    status_code=None,
+    error_type=None,
+    query=None,
+    query_type=None,
+    page=None,
+    url=None,
+    parent_request_id=None,
+):
+    resolved_bucket = bucket_label or format_token_bucket_label(bucket_key)
+    target_label = _normalize_metric_label(target, "unknown")
+    attempt_label = _normalize_metric_label(attempt_stage, "unknown")
+    reason_label = _normalize_metric_label(refresh_reason or "none", "none")
+    outcome_label = _runtime_outcome_label(outcome, status_code=status_code)
+    event = {
+        "timestamp": round(time.time(), 3),
+        "request_id": str(request_id or ""),
+        "parent_request_id": str(parent_request_id or ""),
+        "target": target_label,
+        "attempt_stage": attempt_label,
+        "outcome": outcome_label,
+        "status_code": status_code,
+        "error_type": str(error_type or ""),
+        "refresh_reason": str(refresh_reason or ""),
+        "bucket": resolved_bucket,
+        "query": str(query or ""),
+        "query_type": str(query_type or ""),
+        "page": page,
+        "url": str(url or ""),
+    }
+    with _RUNTIME_METRICS_LOCK:
+        _RUNTIME_METRICS["request_event_total"] += 1
+        event["event_id"] = int(_RUNTIME_METRICS["request_event_total"])
+        _RUNTIME_METRICS["request_outcomes"][f"{target_label}.{attempt_label}.{outcome_label}"] += 1
+        _RUNTIME_METRICS["request_outcomes_by_reason"][
+            f"{target_label}.{attempt_label}.{reason_label}.{outcome_label}"
+        ] += 1
+        _RUNTIME_METRICS["request_bucket_outcomes"][
+            f"{resolved_bucket}|{target_label}|{attempt_label}|{reason_label}|{outcome_label}"
+        ] += 1
+        if len(_RUNTIME_METRICS["recent_request_events"]) >= RUNTIME_REQUEST_EVENT_LIMIT:
+            _RUNTIME_METRICS["recent_request_events"].popleft()
+            _RUNTIME_METRICS["request_event_dropped"] += 1
+        _RUNTIME_METRICS["recent_request_events"].append(event)
 
 
 def find_packed_node():

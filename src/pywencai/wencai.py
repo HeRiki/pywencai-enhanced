@@ -13,7 +13,13 @@ import requests as rq
 from . import convert as convert_module
 from . import headers as headers_module
 from .convert import ConvertError, ConvertHttpError, convert
-from .headers import build_request_headers, format_token_bucket_label, record_session_reset
+from .headers import (
+    allocate_request_id,
+    build_request_headers,
+    format_token_bucket_label,
+    record_request_event,
+    record_session_reset,
+)
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -75,6 +81,12 @@ def _sanitize_headers_for_logging(raw_headers):
     return sanitized
 
 
+def _summarize_request_params_for_logging(request_params):
+    if not isinstance(request_params, dict):
+        return request_params
+    return {key: "<configured>" for key in sorted(request_params.keys())}
+
+
 def _summarize_response_for_logging(text, limit=240):
     compact = " ".join(str(text or "").split())
     if len(compact) <= limit:
@@ -92,6 +104,10 @@ def _format_log_context(**kwargs):
     for key, value in kwargs.items():
         if value is None or value == "":
             continue
+        if str(key).lower() == "cookie":
+            value = "<redacted>"
+        elif key == "request_params" and isinstance(value, dict):
+            value = ",".join(sorted(value.keys())) or "{}"
         parts.append(f"{key}={value}")
     return " | ".join(parts)
 
@@ -119,8 +135,21 @@ def _library_log_scope(log):
             target.disabled = disabled
 
 
-def _build_request_context(question, query_type, cookie, user_agent, request_params, log, target):
+def _build_request_context(
+    question,
+    query_type,
+    cookie,
+    user_agent,
+    request_params,
+    log,
+    target,
+    target_kind=None,
+    request_id=None,
+    parent_request_id=None,
+):
     return {
+        "request_id": request_id or allocate_request_id(target_kind or target),
+        "parent_request_id": parent_request_id,
         "query": question,
         "query_type": query_type,
         "cookie": cookie,
@@ -128,6 +157,7 @@ def _build_request_context(question, query_type, cookie, user_agent, request_par
         "request_params": dict(request_params or {}),
         "log": log,
         "target": target,
+        "target_kind": target_kind or target,
     }
 
 
@@ -150,6 +180,32 @@ def _build_runtime_headers(
         extra_headers=extra_headers,
         force_refresh_token=force_refresh_token,
         refresh_reason=refresh_reason,
+    )
+
+
+def _record_request_outcome(
+    context,
+    *,
+    attempt_stage,
+    outcome,
+    status_code=None,
+    error_type=None,
+    refresh_reason=None,
+):
+    record_request_event(
+        request_id=context.get("request_id"),
+        parent_request_id=context.get("parent_request_id"),
+        target=context.get("target_kind") or context.get("target"),
+        attempt_stage=attempt_stage,
+        outcome=outcome,
+        bucket_label=context.get("bucket"),
+        refresh_reason=refresh_reason,
+        status_code=status_code,
+        error_type=error_type,
+        query=context.get("query"),
+        query_type=context.get("query_type"),
+        page=context.get("page"),
+        url=context.get("target"),
     )
 
 
@@ -198,17 +254,57 @@ def _request_response(
     log=False,
     context=None,
     session=None,
+    attempt_stage="initial",
+    refresh_reason=None,
 ):
-    response = (session or get_session()).request(
-        method=method,
-        url=url,
-        json=json_body,
-        data=form_data,
-        headers=headers_dict,
-        timeout=timeout,
-        **(request_params or {}),
+    try:
+        response = (session or get_session()).request(
+            method=method,
+            url=url,
+            json=json_body,
+            data=form_data,
+            headers=headers_dict,
+            timeout=timeout,
+            **(request_params or {}),
+        )
+    except rq.exceptions.RequestException as exc:
+        if isinstance(exc, rq.exceptions.HTTPError):
+            _record_request_outcome(
+                context or {},
+                attempt_stage=attempt_stage,
+                outcome="http_error",
+                status_code=getattr(getattr(exc, "response", None), "status_code", None),
+                error_type=type(exc).__name__,
+                refresh_reason=refresh_reason,
+            )
+        else:
+            _record_request_outcome(
+                context or {},
+                attempt_stage=attempt_stage,
+                outcome="request_exception",
+                error_type=type(exc).__name__,
+                refresh_reason=refresh_reason,
+            )
+        raise
+    try:
+        response.raise_for_status()
+    except rq.exceptions.HTTPError as exc:
+        _record_request_outcome(
+            context or {},
+            attempt_stage=attempt_stage,
+            outcome="http_error",
+            status_code=getattr(getattr(exc, "response", None), "status_code", None),
+            error_type=type(exc).__name__,
+            refresh_reason=refresh_reason,
+        )
+        raise
+    _record_request_outcome(
+        context or {},
+        attempt_stage=attempt_stage,
+        outcome="success",
+        status_code=response.status_code,
+        refresh_reason=refresh_reason,
     )
-    response.raise_for_status()
     if log:
         _log_with_context(
             "info",
@@ -372,7 +468,14 @@ def _convert_robot_response_with_retry(
 ):
     try:
         return convert(response, raise_on_error=True, request_context=request_context)
-    except ConvertError:
+    except ConvertError as exc:
+        _record_request_outcome(
+            request_context,
+            attempt_stage="initial",
+            outcome="convert_error",
+            error_type=type(exc).__name__,
+            refresh_reason="robot.parse_error",
+        )
         refresh_reason = "robot.parse_error"
         log and _log_with_context(
             "warning",
@@ -407,8 +510,20 @@ def _convert_robot_response_with_retry(
             json_body=data,
             log=log,
             context=refreshed_context,
+            attempt_stage="refresh",
+            refresh_reason=refresh_reason,
         )
-        return convert(response, raise_on_error=True, request_context=request_context)
+        try:
+            return convert(response, raise_on_error=True, request_context=request_context)
+        except ConvertError as refresh_exc:
+            _record_request_outcome(
+                refreshed_context,
+                attempt_stage="refresh",
+                outcome="convert_error",
+                error_type=type(refresh_exc).__name__,
+                refresh_reason=refresh_reason,
+            )
+            raise
 
 
 def get_robot_data(**kwargs):
@@ -437,7 +552,10 @@ def get_robot_data(**kwargs):
 
     with _library_log_scope(log):
         log and _log_with_context("info", "获取condition开始", query=question, query_type=query_type)
-        log and logger.debug(f"请求参数: data={data}, request_params={request_params}")
+        log and logger.debug(
+            f"请求参数: data={data}, request_params={_summarize_request_params_for_logging(request_params)}"
+        )
+        request_id = allocate_request_id("robot")
 
         def do():
             request_context = _build_request_context(
@@ -448,6 +566,8 @@ def get_robot_data(**kwargs):
                 request_params=request_params,
                 log=log,
                 target="get-robot-data",
+                target_kind="robot",
+                request_id=request_id,
             )
             req_headers, bucket_key = _build_runtime_headers(
                 question,
@@ -471,6 +591,7 @@ def get_robot_data(**kwargs):
                     json_body=data,
                     log=log,
                     context=request_context,
+                    attempt_stage="initial",
                 )
             except rq.exceptions.HTTPError as exc:
                 if not _is_auth_http_error(exc):
@@ -510,6 +631,8 @@ def get_robot_data(**kwargs):
                     json_body=data,
                     log=log,
                     context=refreshed_context,
+                    attempt_stage="refresh",
+                    refresh_reason="robot.auth_error",
                 )
 
             params = _convert_robot_response_with_retry(
@@ -598,6 +721,7 @@ def get_page(url_params, **kwargs):
             target=target_url,
             find=find,
         )
+        request_id = allocate_request_id("page")
 
         def do():
             page_no = data.get("page", 1)
@@ -610,6 +734,8 @@ def get_page(url_params, **kwargs):
                 request_params=request_params,
                 log=log,
                 target=target_url,
+                target_kind="page",
+                request_id=request_id,
             )
             request_context["page"] = page_no
             req_headers, bucket_key = _build_runtime_headers(
@@ -631,6 +757,7 @@ def get_page(url_params, **kwargs):
                     form_data=data,
                     log=log,
                     context=request_context,
+                    attempt_stage="initial",
                 )
             except rq.exceptions.HTTPError as exc:
                 if not _is_auth_http_error(exc):
@@ -670,11 +797,20 @@ def get_page(url_params, **kwargs):
                     form_data=data,
                     log=log,
                     context=refreshed_context,
+                    attempt_stage="refresh",
+                    refresh_reason="page.auth_error",
                 )
 
             try:
                 result_payload = _load_json_response(response_text)
-            except WencaiUnexpectedResponseError:
+            except WencaiUnexpectedResponseError as exc:
+                _record_request_outcome(
+                    request_context,
+                    attempt_stage="initial",
+                    outcome="parse_error",
+                    error_type=type(exc).__name__,
+                    refresh_reason="page.parse_error",
+                )
                 log and _log_with_context(
                     "warning",
                     "分页请求首次解析失败，强制刷新token后重试一次",
@@ -708,8 +844,20 @@ def get_page(url_params, **kwargs):
                     form_data=data,
                     log=log,
                     context=refreshed_context,
+                    attempt_stage="refresh",
+                    refresh_reason="page.parse_error",
                 )
-                result_payload = _load_json_response(response_text)
+                try:
+                    result_payload = _load_json_response(response_text)
+                except WencaiUnexpectedResponseError as refresh_exc:
+                    _record_request_outcome(
+                        refreshed_context,
+                        attempt_stage="refresh",
+                        outcome="parse_error",
+                        error_type=type(refresh_exc).__name__,
+                        refresh_reason="page.parse_error",
+                    )
+                    raise
 
             data_list = _extract_data_list(result_payload, path, page_no)
             log and _log_with_context(

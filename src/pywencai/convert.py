@@ -7,7 +7,7 @@ import pandas as pd
 import pydash as _
 import requests as rq
 
-from .headers import build_request_headers, format_token_bucket_label
+from .headers import allocate_request_id, build_request_headers, format_token_bucket_label, record_request_event
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -114,6 +114,34 @@ def _normalize_request_context(request_context):
     return normalized
 
 
+def _record_nested_request_outcome(
+    request_context,
+    *,
+    attempt_stage,
+    outcome,
+    bucket_label,
+    refresh_reason=None,
+    status_code=None,
+    error_type=None,
+    url=None,
+):
+    record_request_event(
+        request_id=request_context.get("request_id"),
+        parent_request_id=request_context.get("parent_request_id"),
+        target="nested",
+        attempt_stage=attempt_stage,
+        outcome=outcome,
+        bucket_label=bucket_label,
+        refresh_reason=refresh_reason,
+        status_code=status_code,
+        error_type=error_type,
+        query=request_context.get("query"),
+        query_type=request_context.get("query_type"),
+        page=request_context.get("page"),
+        url=url,
+    )
+
+
 def _attach_runtime_metadata(comp, request_context=None, depth=0, max_depth=DEFAULT_NESTED_MAX_DEPTH):
     if not isinstance(comp, dict):
         return comp
@@ -155,8 +183,14 @@ def get_url(url, request_context=None, depth=0, max_depth=DEFAULT_NESTED_MAX_DEP
     user_agent = request_context.get("user_agent")
     request_params = dict(request_context.get("request_params") or {})
     log = request_context.get("log", True)
+    parent_request_id = request_context.get("request_id")
+    nested_request_context = {
+        **request_context,
+        "parent_request_id": parent_request_id,
+        "request_id": allocate_request_id("nested"),
+    }
 
-    def send(force_refresh_token=False, refresh_reason=None):
+    def send(force_refresh_token=False, refresh_reason=None, attempt_stage="initial"):
         headers_dict, bucket_key = build_request_headers(
             question=question,
             query_type=query_type,
@@ -172,30 +206,85 @@ def get_url(url, request_context=None, depth=0, max_depth=DEFAULT_NESTED_MAX_DEP
                 f"bucket={format_token_bucket_label(bucket_key)}, "
                 f"refresh_reason={refresh_reason or '-'}"
             )
-        response = _request_without_env_proxy(
-            method="GET",
+        bucket_label = format_token_bucket_label(bucket_key)
+        try:
+            response = _request_without_env_proxy(
+                method="GET",
+                url=full_url,
+                headers=headers_dict,
+                timeout=10,
+                request_params=request_params,
+            )
+        except rq.exceptions.RequestException as exc:
+            _record_nested_request_outcome(
+                nested_request_context,
+                attempt_stage=attempt_stage,
+                outcome="request_exception",
+                bucket_label=bucket_label,
+                refresh_reason=refresh_reason,
+                error_type=type(exc).__name__,
+                url=full_url,
+            )
+            raise
+        try:
+            response.raise_for_status()
+        except rq.exceptions.HTTPError as exc:
+            _record_nested_request_outcome(
+                nested_request_context,
+                attempt_stage=attempt_stage,
+                outcome="http_error",
+                bucket_label=bucket_label,
+                refresh_reason=refresh_reason,
+                status_code=getattr(getattr(exc, "response", None), "status_code", None),
+                error_type=type(exc).__name__,
+                url=full_url,
+            )
+            raise
+        _record_nested_request_outcome(
+            nested_request_context,
+            attempt_stage=attempt_stage,
+            outcome="success",
+            bucket_label=bucket_label,
+            refresh_reason=refresh_reason,
+            status_code=response.status_code,
             url=full_url,
-            headers=headers_dict,
-            timeout=10,
-            request_params=request_params,
         )
-        response.raise_for_status()
-        return _parse_nested_json_response(response.text)
+        try:
+            return _parse_nested_json_response(response.text)
+        except ConvertError as exc:
+            _record_nested_request_outcome(
+                nested_request_context,
+                attempt_stage=attempt_stage,
+                outcome="parse_error",
+                bucket_label=bucket_label,
+                refresh_reason=refresh_reason,
+                error_type=type(exc).__name__,
+                url=full_url,
+            )
+            raise
 
     try:
-        return send(force_refresh_token=False)
+        return send(force_refresh_token=False, attempt_stage="initial")
     except rq.exceptions.HTTPError as exc:
         if not _is_auth_http_error(exc):
             log and logger.warning(f"获取嵌套问财数据失败: url={url}, error={exc}")
             return None
         try:
-            return send(force_refresh_token=True, refresh_reason="nested.auth_error")
+            return send(
+                force_refresh_token=True,
+                refresh_reason="nested.auth_error",
+                attempt_stage="refresh",
+            )
         except Exception as retry_exc:  # pragma: no cover - 次级失败路径
             log and logger.warning(f"获取嵌套问财数据失败: url={url}, error={retry_exc}")
             return None
     except (ConvertError, rq.exceptions.RequestException) as exc:
         try:
-            return send(force_refresh_token=True, refresh_reason="nested.parse_error")
+            return send(
+                force_refresh_token=True,
+                refresh_reason="nested.parse_error",
+                attempt_stage="refresh",
+            )
         except Exception:
             log and logger.warning(f"获取嵌套问财数据失败: url={url}, error={exc}")
             return None

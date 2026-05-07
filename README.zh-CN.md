@@ -178,6 +178,8 @@ python scripts/stress_test.py \
 - token 调用次数 / cache hit / 强刷次数
 - 强刷原因与 session 重置原因
 - token 生成方式分布
+- 首包与强刷后请求的 outcome 分布
+- bucket 级别的请求 outcome 聚合与最近请求事件样本
 
 不要把真实 cookie 或压测结果文件提交进仓库。
 

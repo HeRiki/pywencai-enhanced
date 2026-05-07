@@ -144,6 +144,10 @@ def _counter_delta(after: Dict[str, int], before: Dict[str, int]) -> Dict[str, i
     return {key: int(value) for key, value in delta.items() if value}
 
 
+def _recent_event_delta(after_events: List[Dict[str, Any]], before_total: int) -> List[Dict[str, Any]]:
+    return [event for event in (after_events or []) if int(event.get("event_id", 0)) > int(before_total or 0)]
+
+
 def _exercise_request(
     *,
     query: str,
@@ -212,6 +216,22 @@ def _summarize_phase(
         metrics_after["token_bucket_usage"],
         metrics_before["token_bucket_usage"],
     )
+    request_outcomes = _counter_delta(
+        metrics_after["request_outcomes"],
+        metrics_before["request_outcomes"],
+    )
+    request_outcomes_by_reason = _counter_delta(
+        metrics_after["request_outcomes_by_reason"],
+        metrics_before["request_outcomes_by_reason"],
+    )
+    request_bucket_outcomes = _counter_delta(
+        metrics_after["request_bucket_outcomes"],
+        metrics_before["request_bucket_outcomes"],
+    )
+    recent_request_events = _recent_event_delta(
+        metrics_after["recent_request_events"],
+        metrics_before["request_event_total"],
+    )
 
     return {
         "phase": phase.name,
@@ -256,6 +276,13 @@ def _summarize_phase(
             metrics_after["session_reset_reasons"],
             metrics_before["session_reset_reasons"],
         ),
+        "request_outcomes": request_outcomes,
+        "request_outcomes_by_reason": request_outcomes_by_reason,
+        "request_bucket_outcomes": request_bucket_outcomes,
+        "request_event_dropped": (
+            metrics_after["request_event_dropped"] - metrics_before["request_event_dropped"]
+        ),
+        "recent_request_events": recent_request_events[-20:],
         "token_bucket_usage": bucket_delta,
     }
 
@@ -351,6 +378,21 @@ def _build_report(
         "session_reset_reasons": dict(
             sum((Counter(item["session_reset_reasons"]) for item in phase_list), Counter())
         ),
+        "request_outcomes": dict(
+            sum((Counter(item["request_outcomes"]) for item in phase_list), Counter())
+        ),
+        "request_outcomes_by_reason": dict(
+            sum((Counter(item["request_outcomes_by_reason"]) for item in phase_list), Counter())
+        ),
+        "request_bucket_outcomes": dict(
+            sum((Counter(item["request_bucket_outcomes"]) for item in phase_list), Counter())
+        ),
+        "request_event_dropped": sum(int(item["request_event_dropped"]) for item in phase_list),
+        "recent_request_events": [
+            event
+            for item in phase_list
+            for event in item["recent_request_events"]
+        ][-20:],
     }
     total = aggregated["scheduled_requests"]
     total_successes = aggregated["success_non_empty"] + aggregated["success_empty"]

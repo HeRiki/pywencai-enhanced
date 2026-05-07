@@ -178,6 +178,8 @@ The script reports:
 - token call / cache-hit / forced-refresh count
 - forced-refresh reasons and session-reset reasons
 - token generation mode distribution
+- initial vs. refresh request outcomes
+- bucket-level request outcome aggregation and recent request event samples
 
 Do not commit real cookies or generated reports.
 
