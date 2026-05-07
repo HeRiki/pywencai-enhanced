@@ -581,6 +581,10 @@ def get_robot_data(**kwargs):
                 user_agent=user_agent,
                 request_params=request_params,
                 force_refresh_token=False,
+                # Live stress runs showed that robot-path reuse can trip
+                # initial 401/403 on the same bucket under higher rates.
+                # Keep robot requests off the token cache unless we have
+                # new evidence that this failure mode is gone.
                 cache_policy=CACHE_POLICY_BYPASS,
             )
             request_context["bucket"] = format_token_bucket_label(bucket_key)
@@ -618,6 +622,9 @@ def get_robot_data(**kwargs):
                     request_params=request_params,
                     force_refresh_token=True,
                     refresh_reason="robot.auth_error",
+                    # Auth retry stays on bypass for the same reason as the
+                    # initial robot request: do not recycle the unstable
+                    # bucket token back into the robot path.
                     cache_policy=CACHE_POLICY_BYPASS,
                 )
                 refreshed_context = {

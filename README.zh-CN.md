@@ -115,7 +115,9 @@ df = pywencai.get(
 - 普通使用者不需要执行 `npm install`，因为仓库已经带了构建好的 `hexin-v.bundle.js`。
 - 为了获得更稳定的 token 生成能力，运行环境仍推荐安装 Node.js。
 - 如果没有 Node.js，包会回退到 Python 生成 token；这个回退路径可以用，但稳定性可能不如 Node 方案。
-- token 只会在同一短生命周期请求桶内复用，请求桶由 `cookie + 解析后的 User-Agent + 显式代理身份` 组成；切账号、切 UA、切显式代理时会自动换桶。
+- `page` 和 `nested` 请求里的 token 只会在同一短生命周期请求桶内复用，请求桶由 `cookie + 解析后的 User-Agent + 显式代理身份` 组成；切账号、切 UA、切显式代理时会自动换桶。
+- `get-robot-data` 被有意排除在这条复用规则之外。真实高频压测里已经观察到：`robot` 路径复用同一 bucket token 时，会先出现 `initial 401/403`，随后只有强制刷新 token 才能恢复。
+- 基于这个已观测到的失败模式，`robot` 路径现在固定为首包和鉴权重试都生成新 token，而不是继续复用 bucket cache。
 - 嵌套跟进请求会继承顶层 `cookie`、`user_agent` 和显式 `request_params`，包括 `proxies`、`verify`、`allow_redirects`。
 
 ## 日志
@@ -185,6 +187,7 @@ python scripts/stress_test.py \
 当前默认策略：
 
 - `get-robot-data` 的首包和鉴权重试都绕过 token cache
+- 这不是泛化的“尽量少复用”，而是针对高频下已观测到的 `robot.initial.401/403 -> refresh success` 模式做的定点规避
 - `page` 和 `nested` 请求暂时仍保留正常的 cache reuse 策略
 
 不要把真实 cookie 或压测结果文件提交进仓库。

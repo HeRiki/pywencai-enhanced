@@ -115,7 +115,9 @@ The current `get(...)` interface remains compatible with these common parameters
 - Normal users do not need `npm install`. The repository already includes the built `hexin-v.bundle.js`.
 - Node.js is still recommended for best token-generation compatibility at runtime.
 - If Node.js is not available, the package falls back to a Python-generated token. That fallback is convenient, but it may be less reliable than the Node-based path.
-- Tokens are reused only within the same short-lived request bucket: `cookie + resolved User-Agent + explicit proxy identity`. Switching account, User-Agent, or explicit proxy automatically uses a different bucket.
+- `page` and `nested` requests reuse tokens only within the same short-lived request bucket: `cookie + resolved User-Agent + explicit proxy identity`. Switching account, User-Agent, or explicit proxy automatically uses a different bucket.
+- `get-robot-data` is intentionally excluded from that reuse rule. Live stress runs showed that reusing the same bucket token on the `robot` path can first fail with `initial 401/403` under higher request rates, then recover only after a forced refresh.
+- Because of that observed failure mode, the `robot` path now always generates a fresh token for the initial request and the auth retry instead of reusing the bucket cache.
 - Nested follow-up requests inherit the top-level `cookie`, `user_agent`, and explicit `request_params` such as `proxies`, `verify`, and `allow_redirects`.
 
 ## Logging
@@ -185,6 +187,7 @@ The script reports:
 Current default policy:
 
 - `get-robot-data` bypasses the token cache for both the initial request and auth retry
+- this is not a generic preference for "less reuse"; it is a specific mitigation for the observed `robot.initial.401/403 -> refresh success` pattern under higher request rates
 - `page` and `nested` requests still use the normal cache reuse policy
 
 Do not commit real cookies or generated reports.
