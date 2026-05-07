@@ -156,6 +156,30 @@ Run the standalone package tests with:
 PYTHONPATH=src python -m unittest tests.test_pywencai
 ```
 
+## Live stress check
+
+For controlled live traffic validation, use the built-in stress script with a real cookie loaded from an environment variable, a text file, or a YAML config:
+
+```bash
+python scripts/stress_test.py \
+  --cookie-config /path/to/config.local.yaml \
+  --cookie-key data.cookie \
+  --query "平安银行" \
+  --phase warmup:1:15:1 \
+  --phase medium:2:15:2 \
+  --phase hot:4:10:4
+```
+
+The script reports:
+
+- success vs. empty `DataFrame` vs. raised failures
+- latency percentiles
+- HTTP status distribution
+- token call / forced-refresh count
+- session reset count
+
+Do not commit real cookies or generated reports.
+
 ## Attribution
 
 This project is an enhanced derivative of the upstream [`zsrl/pywencai`](https://github.com/zsrl/pywencai) project and keeps the original MIT license. The enhanced request, retry, parsing, packaging, and test coverage in this repository are maintained separately for more reliable day-to-day usage.

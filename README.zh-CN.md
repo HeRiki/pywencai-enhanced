@@ -156,6 +156,30 @@ npx webpack --config webpack.config.js
 PYTHONPATH=src python -m unittest tests.test_pywencai
 ```
 
+## 真实压测
+
+如果要做受控的真实链路高频验证，可以使用内置压测脚本，并从环境变量、文本文件或 YAML 配置中读取真实 cookie：
+
+```bash
+python scripts/stress_test.py \
+  --cookie-config /path/to/config.local.yaml \
+  --cookie-key data.cookie \
+  --query "平安银行" \
+  --phase warmup:1:15:1 \
+  --phase medium:2:15:2 \
+  --phase hot:4:10:4
+```
+
+脚本会输出：
+
+- 成功 / 空 `DataFrame` / 抛异常 的分布
+- 延迟分位数
+- HTTP 状态码分布
+- token 调用次数 / 强刷次数
+- session 重置次数
+
+不要把真实 cookie 或压测结果文件提交进仓库。
+
 ## 致谢与来源
 
 这个项目是上游 [`zsrl/pywencai`](https://github.com/zsrl/pywencai) 的增强版衍生实现，并保留原始 MIT 许可证。当前仓库在请求重试、鉴权恢复、解析能力、打包方式和测试覆盖方面做了单独增强，用于更稳定的日常使用。
