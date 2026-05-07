@@ -189,6 +189,9 @@ class TestPyWencaiHelpers(unittest.TestCase):
         self.assertEqual(headers_module.logger.name, "pywencai.headers")
         self.assertEqual(convert_module.logger.name, "pywencai.convert")
         self.assertEqual(wencai_module.logger.name, "pywencai.wencai")
+        self.assertEqual(headers_module.logger.level, logging.INFO)
+        self.assertEqual(convert_module.logger.level, logging.INFO)
+        self.assertEqual(wencai_module.logger.level, logging.INFO)
 
     def test_sanitize_headers_for_logging_redacts_sensitive_values(self):
         sanitized = wencai_module._sanitize_headers_for_logging(
@@ -858,6 +861,45 @@ class TestPyWencaiHelpers(unittest.TestCase):
         self.assertEqual(result["row_count"], 2)
         self.assertEqual(result["data"]["condition"], "十日涨幅前十")
         self.assertEqual(result["url_params"]["querytype"], "stock")
+
+    def test_convert_logs_summary_instead_of_full_payload(self):
+        capture_logger, handler = self._build_capture_logger("pywencai.convert.summary")
+        pywencai.configure_logger(capture_logger)
+        response = Mock()
+        response.text = self._read_fixture("robot_data_xuangu_table_v1.json")
+        response.raise_for_status = Mock()
+        response.status_code = 200
+
+        convert_module.convert(response, raise_on_error=True)
+
+        messages = [record.getMessage() for record in handler.records]
+        self.assertTrue(any("convert函数结果摘要" in message for message in messages))
+        self.assertFalse(any("解析出的content: {" in message for message in messages))
+        self.assertFalse(any("convert函数完整处理结果:" in message for message in messages))
+
+    def test_fetch_result_dataframe_logs_summary_instead_of_full_params(self):
+        capture_logger, handler = self._build_capture_logger("pywencai.wencai.summary")
+        pywencai.configure_logger(capture_logger)
+        frame = pd.DataFrame([{"股票代码": "600001"}])
+        params = {
+            "data": {"condition": "A股；股票代码；股票简称", "detail": frame},
+            "row_count": 1,
+            "url": "/gateway/test",
+            "url_params": {
+                "query": "A股；股票代码；股票简称",
+                "page": "1",
+                "perpage": "30",
+                "uuid": "24087",
+            },
+        }
+
+        result = wencai_module._fetch_result_dataframe(params, log=True)
+
+        self.assertIsInstance(result, pd.DataFrame)
+        messages = [record.getMessage() for record in handler.records]
+        self.assertTrue(any("url_params摘要=" in message for message in messages))
+        self.assertTrue(any("get_robot_data返回摘要" in message for message in messages))
+        self.assertFalse(any("get_robot_data完整返回:" in message for message in messages))
 
     def test_convert_raises_missing_components_error(self):
         response = Mock()

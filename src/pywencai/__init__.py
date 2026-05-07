@@ -9,8 +9,8 @@ from .wencai import get
 def _module_logger_specs():
     return (
         (_headers_module, logging.INFO),
-        (_convert_module, logging.DEBUG),
-        (_wencai_module, logging.DEBUG),
+        (_convert_module, logging.INFO),
+        (_wencai_module, logging.INFO),
     )
 
 

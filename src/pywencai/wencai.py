@@ -24,7 +24,7 @@ from .headers import (
 )
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 
 REQUEST_CONFIG = {
     "robot": {"timeout": (10, 30), "retry": 10, "sleep": 0},
@@ -94,6 +94,49 @@ def _summarize_response_for_logging(text, limit=240):
     if len(compact) <= limit:
         return compact
     return f"{compact[:limit]}..."
+
+
+def _summarize_url_params_for_logging(url_params):
+    if not isinstance(url_params, dict):
+        return {"type": type(url_params).__name__}
+    summary = {
+        "keys": sorted(url_params.keys()),
+    }
+    for key in ("page", "perpage", "query_type", "comp_id", "uuid"):
+        if key in url_params:
+            summary[key] = url_params[key]
+    return summary
+
+
+def _summarize_condition_for_logging(condition, limit=120):
+    if condition is None:
+        return None
+    if isinstance(condition, dict):
+        return {"type": "dict", "keys": sorted(condition.keys())}
+    if isinstance(condition, list):
+        return {"type": "list", "length": len(condition)}
+    return _summarize_response_for_logging(condition, limit=limit)
+
+
+def _summarize_params_for_logging(params):
+    if not isinstance(params, dict):
+        return {"type": type(params).__name__}
+    data = params.get("data")
+    summary = {
+        "keys": sorted(params.keys()),
+        "row_count": params.get("row_count"),
+        "has_url": bool(params.get("url")),
+    }
+    if isinstance(data, pd.DataFrame):
+        summary["data_shape"] = list(data.shape)
+    elif isinstance(data, dict):
+        summary["data_keys"] = sorted(data.keys())
+    else:
+        summary["data_type"] = type(data).__name__
+    url_params = params.get("url_params")
+    if isinstance(url_params, dict):
+        summary["url_param_keys"] = sorted(url_params.keys())
+    return summary
 
 
 def _is_html_response_text(text):
@@ -669,7 +712,7 @@ def get_robot_data(**kwargs):
                 target="get-robot-data",
                 result_keys=",".join(params.keys()) if params else "empty",
             )
-            log and logger.debug(f"get_robot_data返回完整结果: {params}")
+            log and logger.debug(f"get_robot_data结果摘要: {_summarize_params_for_logging(params)}")
             return params
 
         result = while_do(
@@ -965,9 +1008,12 @@ def _fetch_result_dataframe(params, loop=False, log=False, strict=False, **kwarg
     condition = _.get(data, "condition")
 
     log and logger.info(
-        f"get_robot_data返回数据: data类型={type(data)}, url_params={url_params}, condition={condition}"
+        "get_robot_data返回数据: "
+        f"data类型={type(data).__name__}, "
+        f"url_params摘要={_summarize_url_params_for_logging(url_params)}, "
+        f"condition摘要={_summarize_condition_for_logging(condition)}"
     )
-    log and logger.debug(f"get_robot_data完整返回: {params}")
+    log and logger.debug(f"get_robot_data返回摘要: {_summarize_params_for_logging(params)}")
 
     if condition is not None:
         page_kwargs = {**kwargs, **data}

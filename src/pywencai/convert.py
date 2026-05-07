@@ -16,7 +16,7 @@ from .headers import (
 )
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 
 UNKNOWN_SHOW_TYPE_COUNTS = {}
 DEFAULT_NESTED_MAX_DEPTH = 3
@@ -53,6 +53,41 @@ class ConvertMissingComponentsError(ConvertError):
 
 def _response_snippet(text, limit=500):
     return (text or "").strip()[:limit]
+
+
+def _summarize_content_for_logging(content):
+    if isinstance(content, dict):
+        components = content.get("components")
+        summary = {
+            "type": "dict",
+            "keys": sorted(content.keys()),
+        }
+        if isinstance(components, list):
+            summary["components_count"] = len(components)
+            if components:
+                summary["first_show_type"] = _.get(components[0], "show_type")
+        return summary
+    if isinstance(content, list):
+        return {"type": "list", "length": len(content)}
+    return {"type": type(content).__name__, "snippet": _response_snippet(str(content), 240)}
+
+
+def _summarize_params_for_logging(params):
+    if not isinstance(params, dict):
+        return {"type": type(params).__name__}
+    data = params.get("data")
+    summary = {
+        "keys": sorted(params.keys()),
+        "row_count": params.get("row_count"),
+        "has_url": bool(params.get("url")),
+    }
+    if isinstance(data, pd.DataFrame):
+        summary["data_shape"] = list(data.shape)
+    elif isinstance(data, dict):
+        summary["data_keys"] = sorted(data.keys())
+    else:
+        summary["data_type"] = type(data).__name__
+    return summary
 
 
 def _request_without_env_proxy(method, url, timeout, request_params=None, **kwargs):
@@ -601,7 +636,7 @@ def _parse_robot_response(res):
 
     try:
         result = json.loads(res.text)
-        logger.debug(f"原始响应内容: {_response_snippet(res.text, 1000)}...")
+        logger.debug(f"原始响应摘要: {_response_snippet(res.text, 240)}...")
     except json.JSONDecodeError as exc:
         raise ConvertInvalidJsonError(f"JSON解析失败: {exc}; snippet={_response_snippet(res.text)}") from exc
 
@@ -611,7 +646,7 @@ def _parse_robot_response(res):
         raise ConvertInvalidContentError("content 缺失")
 
     if isinstance(content, str):
-        logger.debug(f"解析出的content: {_response_snippet(content)}...")
+        logger.debug(f"解析出的content摘要: {_response_snippet(content, 240)}...")
         try:
             content = json.loads(content)
         except json.JSONDecodeError as exc:
@@ -619,7 +654,7 @@ def _parse_robot_response(res):
                 f"content字符串JSON解析失败: {exc}; snippet={_response_snippet(content)}"
             ) from exc
     else:
-        logger.debug(f"解析出的content: {content}")
+        logger.debug(f"解析出的content摘要: {_summarize_content_for_logging(content)}")
 
     if not isinstance(content, dict):
         raise ConvertInvalidContentError(f"content 不是字典类型: type={type(content).__name__}")
@@ -677,13 +712,7 @@ def convert(res, raise_on_error=False, request_context=None):
         logger.info(
             f"convert函数处理结果: components数量={len(components)}, 返回params={params.keys() if params else '空'}"
         )
-        try:
-            logger.debug(f"convert函数完整处理结果: {params}")
-        except Exception as exc:  # pragma: no cover - 仅日志兜底
-            logger.debug(
-                f"convert函数完整处理结果记录失败，仅记录keys: "
-                f"{params.keys() if params else '空'}, 错误: {exc}"
-            )
+        logger.debug(f"convert函数结果摘要: {_summarize_params_for_logging(params)}")
         return params
     except rq.exceptions.HTTPError as exc:
         wrapped = ConvertHttpError(f"HTTP错误: 状态码={getattr(res, 'status_code', 'unknown')}, 响应={exc}")
