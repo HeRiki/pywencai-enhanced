@@ -1,23 +1,22 @@
 import json
-from typing import Any, Dict, List
-import math
-from urllib.parse import quote
-
-import requests as rq
-import pandas as pd
-import time
 import logging
-import pydash as _
-from .convert import (
-    ConvertError,
-    ConvertHttpError,
-    convert,
-)
-from .headers import headers
+import math
+import random
+import time
+from contextlib import contextmanager, nullcontext
+from typing import Any, Dict, List
 
-# 使用根日志记录器，不再使用自定义StreamHandler
+import pandas as pd
+import pydash as _
+import requests as rq
+
+from . import convert as convert_module
+from . import headers as headers_module
+from .convert import ConvertError, ConvertHttpError, convert
+from .headers import build_request_headers, format_token_bucket_label
+
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)  # 设置为DEBUG级别，确保所有日志都能被记录
+logger.setLevel(logging.DEBUG)
 
 REQUEST_CONFIG = {
     "robot": {"timeout": (10, 30), "retry": 10, "sleep": 0},
@@ -76,8 +75,7 @@ def _sanitize_headers_for_logging(raw_headers):
 
 
 def _summarize_response_for_logging(text, limit=240):
-    text = text or ""
-    compact = " ".join(str(text).split())
+    compact = " ".join(str(text or "").split())
     if len(compact) <= limit:
         return compact
     return f"{compact[:limit]}..."
@@ -103,20 +101,53 @@ def _log_with_context(level, message, **context):
     getattr(logger, level)(full_message)
 
 
-def _build_request_headers(question, query_type='stock', cookie=None, user_agent=None, extra_headers=None, force_refresh_token=False):
-    req_headers = headers(cookie, user_agent, force_refresh_token=force_refresh_token)
-    req_headers.update({
-        'Accept': 'application/json, text/plain, */*',
-        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-        'Accept-Encoding': 'gzip, deflate',
-        'Connection': 'keep-alive',
-        'Origin': 'https://www.iwencai.com',
-        'Referer': build_result_referer(question, query_type=query_type),
-        'X-Requested-With': 'XMLHttpRequest',
-    })
-    if extra_headers:
-        req_headers.update(extra_headers)
-    return req_headers
+@contextmanager
+def _library_log_scope(log):
+    if log:
+        yield
+        return
+
+    managed_loggers = [logger, convert_module.logger, headers_module.logger]
+    previous_states = [target.disabled for target in managed_loggers]
+    try:
+        for target in managed_loggers:
+            target.disabled = True
+        yield
+    finally:
+        for target, disabled in zip(managed_loggers, previous_states):
+            target.disabled = disabled
+
+
+def _build_request_context(question, query_type, cookie, user_agent, request_params, log, target):
+    return {
+        "query": question,
+        "query_type": query_type,
+        "cookie": cookie,
+        "user_agent": user_agent,
+        "request_params": dict(request_params or {}),
+        "log": log,
+        "target": target,
+    }
+
+
+def _build_runtime_headers(
+    question,
+    query_type="stock",
+    cookie=None,
+    user_agent=None,
+    request_params=None,
+    extra_headers=None,
+    force_refresh_token=False,
+):
+    return build_request_headers(
+        question=question,
+        query_type=query_type,
+        cookie=cookie,
+        user_agent=user_agent,
+        request_params=request_params,
+        extra_headers=extra_headers,
+        force_refresh_token=force_refresh_token,
+    )
 
 
 def _load_json_response(response_text):
@@ -178,31 +209,21 @@ def _request_response(
     if log:
         _log_with_context(
             "info",
-            '请求返回',
+            "请求返回",
             **{
                 **(context or {}),
                 "status_code": response.status_code,
                 "response_bytes": len(response.text),
             },
         )
-        logger.debug(f'响应头: {dict(response.headers)}')
-        logger.debug(f'响应内容摘要: {_summarize_response_for_logging(response.text)}')
+        logger.debug(f"响应头: {dict(response.headers)}")
+        logger.debug(f"响应内容摘要: {_summarize_response_for_logging(response.text)}")
     return response
 
 
 def _request_text(**kwargs):
     response = _request_response(**kwargs)
     return response.text
-
-
-def build_result_referer(question, query_type='stock'):
-    """构造更贴近浏览器的问财结果页 Referer。"""
-    encoded_question = quote(str(question or ''))
-    sign = int(time.time() * 1000)
-    return (
-        f"{IWENCAI_BASE_URL}/unifiedwap/result?"
-        f"w={encoded_question}&querytype={query_type}&sign={sign}"
-    )
 
 
 def _should_retry_exception(exc):
@@ -236,376 +257,478 @@ def _is_auth_http_error(exc):
 
 
 def _connection_retry_backoff_seconds(attempt, configured_sleep):
-    base_sleep = float(configured_sleep or 0)
-    transport_backoff = min(1.0, 0.2 * max(attempt, 1))
-    return max(base_sleep, transport_backoff)
+    exponential_backoff = min(2.0, 0.2 * (2 ** max(attempt - 1, 0)))
+    return max(float(configured_sleep or 0), exponential_backoff)
 
 
-def while_do(do, retry=10, sleep=0, log=False):
+def _retry_sleep_seconds(attempt, configured_sleep):
+    base_sleep = _connection_retry_backoff_seconds(attempt, configured_sleep)
+    jitter_ceiling = min(0.05, base_sleep * 0.1)
+    return base_sleep + random.uniform(0, jitter_ceiling)
+
+
+def while_do(do, retry=10, sleep=0, log=False, raise_last_exception=False):
     """
-    重试执行函数，带有详细的错误日志
-    
+    重试执行函数，带有分类错误日志和统一退避策略。
+
     Args:
         do: 要执行的函数
         retry: 最大重试次数
         sleep: 重试间隔（秒）
         log: 是否记录日志
+        raise_last_exception: 失败时是否抛出最后一次异常
     """
     import traceback
-    count = 0
-    while count < retry:
-        time.sleep(sleep)
+
+    attempt = 0
+    last_exception = None
+    while attempt < retry:
         try:
             return do()
-        except rq.exceptions.Timeout as e:
-            log and _log_with_context("error", f'{count+1}次尝试失败: 请求超时 - {e}', retry_count=retry, attempt=count + 1)
-            if not _should_retry_exception(e):
-                break
-        except rq.exceptions.ConnectionError as e:
-            log and _log_with_context("error", f'{count+1}次尝试失败: 连接错误 - {e}', retry_count=retry, attempt=count + 1)
-            if not _should_retry_exception(e):
-                break
-            reset_runtime_http_state()
-            if count + 1 < retry:
-                backoff_seconds = _connection_retry_backoff_seconds(count + 1, sleep)
-                log and _log_with_context(
-                    "warning",
-                    '连接错误后重置HTTP会话并等待后重试',
-                    retry_count=retry,
-                    attempt=count + 1,
-                    backoff_seconds=backoff_seconds,
-                )
-                time.sleep(backoff_seconds)
-        except rq.exceptions.HTTPError as e:
-            status_code = getattr(getattr(e, "response", None), "status_code", None)
+        except rq.exceptions.Timeout as exc:
+            last_exception = exc
             log and _log_with_context(
                 "error",
-                f'{count+1}次尝试失败: HTTP错误(status={status_code}) - {e}',
+                f"{attempt + 1}次尝试失败: 请求超时 - {exc}",
                 retry_count=retry,
-                attempt=count + 1,
+                attempt=attempt + 1,
+            )
+        except rq.exceptions.ConnectionError as exc:
+            last_exception = exc
+            log and _log_with_context(
+                "error",
+                f"{attempt + 1}次尝试失败: 连接错误 - {exc}",
+                retry_count=retry,
+                attempt=attempt + 1,
+            )
+            reset_runtime_http_state()
+        except rq.exceptions.HTTPError as exc:
+            last_exception = exc
+            status_code = getattr(getattr(exc, "response", None), "status_code", None)
+            log and _log_with_context(
+                "error",
+                f"{attempt + 1}次尝试失败: HTTP错误(status={status_code}) - {exc}",
+                retry_count=retry,
+                attempt=attempt + 1,
                 status_code=status_code,
             )
-            if not _should_retry_exception(e):
-                break
-        except Exception as e:
+        except Exception as exc:  # pragma: no cover - 由具体测试分支覆盖
+            last_exception = exc
             log and _log_with_context(
                 "error",
-                f'{count+1}次尝试失败: {type(e).__name__} - {e}',
+                f"{attempt + 1}次尝试失败: {type(exc).__name__} - {exc}",
                 retry_count=retry,
-                attempt=count + 1,
-                error_type=type(e).__name__,
+                attempt=attempt + 1,
+                error_type=type(exc).__name__,
             )
-            log and logger.debug(f'异常堆栈: {traceback.format_exc()}')
-            if not _should_retry_exception(e):
-                break
-        count += 1
+            log and logger.debug(f"异常堆栈: {traceback.format_exc()}")
+
+        attempt += 1
+        if last_exception is None or not _should_retry_exception(last_exception):
+            break
+        if attempt >= retry:
+            break
+
+        backoff_seconds = _retry_sleep_seconds(attempt, sleep)
+        log and _log_with_context(
+            "warning",
+            "请求失败后等待后重试",
+            retry_count=retry,
+            attempt=attempt,
+            backoff_seconds=round(backoff_seconds, 3),
+        )
+        time.sleep(backoff_seconds)
+
+    if raise_last_exception and last_exception is not None:
+        raise last_exception
     return None
 
 
-def get_robot_data(**kwargs):
-    '''获取condition'''
-    retry = kwargs.get('retry', REQUEST_CONFIG["robot"]["retry"])
-    sleep = kwargs.get('sleep', REQUEST_CONFIG["robot"]["sleep"])
-    # 同时支持query和question参数
-    question = kwargs.get('query') or kwargs.get('question')
-    log = kwargs.get('log', True)  # 默认开启日志
-    query_type = kwargs.get('query_type', 'stock')
-    cookie = kwargs.get('cookie', None)
-    user_agent = kwargs.get('user_agent', None)
-    request_params = kwargs.get('request_params', {})
-    data = {
-        'add_info': '{"urp":{"scene":1,"company":1,"business":1},"contentType":"json","searchInfo":true}',
-        'perpage': '10',
-        'page': 1,
-        'source': 'Ths_iwencai_Xuangu',
-        'log_info': '{"input_type":"click"}',
-        'version': '2.0',
-        'secondary_intent': query_type,
-        'question': question
+def replace_key(key):
+    """替换兼容参数名。"""
+    key_map = {
+        "question": "query",
+        "sort_key": "urp_sort_index",
+        "sort_order": "urp_sort_way",
     }
+    return key_map.get(key, key)
 
-    pro = kwargs.get('pro', False)
 
-    if pro:
-        data['iwcpro'] = 1
+def _convert_robot_response_with_retry(
+    response,
+    *,
+    question,
+    query_type,
+    cookie,
+    user_agent,
+    request_params,
+    data,
+    timeout,
+    log,
+    request_context,
+):
+    try:
+        return convert(response, raise_on_error=True, request_context=request_context)
+    except ConvertError:
+        log and _log_with_context(
+            "warning",
+            "get-robot-data首次解析失败，强制刷新token后重试一次",
+            **request_context,
+        )
+        refreshed_headers, refreshed_bucket_key = _build_runtime_headers(
+            question,
+            query_type=query_type,
+            cookie=cookie,
+            user_agent=user_agent,
+            request_params=request_params,
+            force_refresh_token=True,
+        )
+        refreshed_context = {
+            **request_context,
+            "token_refresh": "forced",
+            "bucket": format_token_bucket_label(refreshed_bucket_key),
+        }
+        log and logger.debug(
+            f"刷新token后的请求头(脱敏): {_sanitize_headers_for_logging(refreshed_headers)}"
+        )
+        response = _request_response(
+            method="POST",
+            url=ROBOT_DATA_URL,
+            headers_dict=refreshed_headers,
+            timeout=timeout,
+            request_params=request_params,
+            json_body=data,
+            log=log,
+            context=refreshed_context,
+        )
+        return convert(response, raise_on_error=True, request_context=request_context)
 
-    _log_with_context("info", '获取condition开始', query=question, query_type=query_type)
-    logger.debug(f'请求参数: data={data}, request_params={request_params}')
 
-    def do():
-        try:
-            req_headers = _build_request_headers(
+def get_robot_data(**kwargs):
+    """获取 condition。"""
+    retry = kwargs.get("retry", REQUEST_CONFIG["robot"]["retry"])
+    sleep = kwargs.get("sleep", REQUEST_CONFIG["robot"]["sleep"])
+    question = kwargs.get("query") or kwargs.get("question")
+    log = kwargs.get("log", True)
+    strict = kwargs.get("strict", False)
+    query_type = kwargs.get("query_type", "stock")
+    cookie = kwargs.get("cookie", None)
+    user_agent = kwargs.get("user_agent", None)
+    request_params = kwargs.get("request_params", {})
+    data = {
+        "add_info": '{"urp":{"scene":1,"company":1,"business":1},"contentType":"json","searchInfo":true}',
+        "perpage": "10",
+        "page": 1,
+        "source": "Ths_iwencai_Xuangu",
+        "log_info": '{"input_type":"click"}',
+        "version": "2.0",
+        "secondary_intent": query_type,
+        "question": question,
+    }
+    if kwargs.get("pro", False):
+        data["iwcpro"] = 1
+
+    with _library_log_scope(log):
+        log and _log_with_context("info", "获取condition开始", query=question, query_type=query_type)
+        log and logger.debug(f"请求参数: data={data}, request_params={request_params}")
+
+        def do():
+            request_context = _build_request_context(
+                question=question,
+                query_type=query_type,
+                cookie=cookie,
+                user_agent=user_agent,
+                request_params=request_params,
+                log=log,
+                target="get-robot-data",
+            )
+            req_headers, bucket_key = _build_runtime_headers(
                 question,
                 query_type=query_type,
                 cookie=cookie,
                 user_agent=user_agent,
-                # hexin-v 对 get-robot-data 的容忍度很低，复用缓存 token
-                # 容易出现“首次 401/403，强刷后成功”的假失败。
-                force_refresh_token=True,
+                request_params=request_params,
+                force_refresh_token=False,
             )
-            request_context = {
-                "query": question,
-                "query_type": query_type,
-                "target": 'get-robot-data',
-            }
-            _log_with_context("info", '发送请求到get-robot-data', **request_context)
-            logger.debug(f'请求头(脱敏): {_sanitize_headers_for_logging(req_headers)}')
+            request_context["bucket"] = format_token_bucket_label(bucket_key)
+            log and _log_with_context("info", "发送请求到get-robot-data", **request_context)
+            log and logger.debug(f"请求头(脱敏): {_sanitize_headers_for_logging(req_headers)}")
 
             try:
                 response = _request_response(
-                    method='POST',
+                    method="POST",
                     url=ROBOT_DATA_URL,
                     headers_dict=req_headers,
                     timeout=REQUEST_CONFIG["robot"]["timeout"],
                     request_params=request_params,
                     json_body=data,
-                    log=True,
+                    log=log,
                     context=request_context,
                 )
             except rq.exceptions.HTTPError as exc:
                 if not _is_auth_http_error(exc):
                     raise
-                _log_with_context(
+                log and _log_with_context(
                     "warning",
-                    'get-robot-data首次鉴权失败，强制刷新token后重试一次',
+                    "get-robot-data首次鉴权失败，强制刷新token后重试一次",
                     **request_context,
                     status_code=getattr(getattr(exc, "response", None), "status_code", None),
                 )
                 reset_runtime_http_state()
-                refreshed_headers = _build_request_headers(
+                refreshed_headers, refreshed_bucket_key = _build_runtime_headers(
                     question,
                     query_type=query_type,
                     cookie=cookie,
                     user_agent=user_agent,
+                    request_params=request_params,
                     force_refresh_token=True,
                 )
-                logger.debug(f'刷新token后的请求头(脱敏): {_sanitize_headers_for_logging(refreshed_headers)}')
+                refreshed_context = {
+                    **request_context,
+                    "token_refresh": "forced",
+                    "refresh_reason": "auth_error",
+                    "bucket": format_token_bucket_label(refreshed_bucket_key),
+                }
+                log and logger.debug(
+                    f"刷新token后的请求头(脱敏): {_sanitize_headers_for_logging(refreshed_headers)}"
+                )
                 response = _request_response(
-                    method='POST',
+                    method="POST",
                     url=ROBOT_DATA_URL,
                     headers_dict=refreshed_headers,
                     timeout=REQUEST_CONFIG["robot"]["timeout"],
                     request_params=request_params,
                     json_body=data,
-                    log=True,
-                    context={**request_context, "token_refresh": "forced", "refresh_reason": "auth_error"},
+                    log=log,
+                    context=refreshed_context,
                 )
 
-            try:
-                params = convert(response, raise_on_error=True)
-            except ConvertError:
-                _log_with_context("warning", 'get-robot-data首次解析失败，强制刷新token后重试一次', **request_context)
-                refreshed_headers = _build_request_headers(
-                    question,
-                    query_type=query_type,
-                    cookie=cookie,
-                    user_agent=user_agent,
-                    force_refresh_token=True,
-                )
-                logger.debug(f'刷新token后的请求头(脱敏): {_sanitize_headers_for_logging(refreshed_headers)}')
-                response = _request_response(
-                    method='POST',
-                    url=ROBOT_DATA_URL,
-                    headers_dict=refreshed_headers,
-                    timeout=REQUEST_CONFIG["robot"]["timeout"],
-                    request_params=request_params,
-                    json_body=data,
-                    log=True,
-                    context={**request_context, "token_refresh": "forced"},
-                )
-                params = convert(response, raise_on_error=True)
-            _log_with_context(
+            params = _convert_robot_response_with_retry(
+                response,
+                question=question,
+                query_type=query_type,
+                cookie=cookie,
+                user_agent=user_agent,
+                request_params=request_params,
+                data=data,
+                timeout=REQUEST_CONFIG["robot"]["timeout"],
+                log=log,
+                request_context=request_context,
+            )
+            log and _log_with_context(
                 "info",
-                '获取get_robot_data成功',
+                "获取get_robot_data成功",
                 query=question,
                 query_type=query_type,
-                target='get-robot-data',
-                result_keys=','.join(params.keys()) if params else 'empty',
+                target="get-robot-data",
+                result_keys=",".join(params.keys()) if params else "empty",
             )
-            logger.debug(f'get_robot_data返回完整结果: {params}')
+            log and logger.debug(f"get_robot_data返回完整结果: {params}")
             return params
-        except rq.exceptions.Timeout as e:
-            logger.error(f'请求超时: {e}')
-            raise
-        except rq.exceptions.ConnectionError as e:
-            logger.error(f'连接错误: {e}')
-            raise
-        except rq.exceptions.RequestException as e:
-            logger.error(f'请求异常: {e}')
-            raise
-        except Exception as e:
-            logger.error(f'处理响应时发生异常: {e}', exc_info=True)
-            raise
 
-    result = while_do(do, retry, sleep, log)
-
-    if result is None:
-        _log_with_context("error", '获取get_robot_data失败', query=question, query_type=query_type, retry_count=retry)
-    
-    return result
-
-
-def replace_key(key):
-    '''替换key'''
-    key_map = {
-        'question': 'query',
-        'sort_key': 'urp_sort_index',
-        'sort_order': 'urp_sort_way'
-    }
-    return key_map.get(key, key)
+        result = while_do(
+            do,
+            retry=retry,
+            sleep=sleep,
+            log=log,
+            raise_last_exception=strict,
+        )
+        if result is None:
+            log and _log_with_context(
+                "error",
+                "获取get_robot_data失败",
+                query=question,
+                query_type=query_type,
+                retry_count=retry,
+            )
+            if strict:
+                raise WencaiUnexpectedResponseError("get_robot_data返回None")
+        return result
 
 
 def get_page(url_params, **kwargs):
-    '''获取每页数据'''
-    retry = kwargs.pop('retry', REQUEST_CONFIG["page"]["retry"])
-    sleep = kwargs.pop('sleep', REQUEST_CONFIG["page"]["sleep"])
-    log = kwargs.pop('log', False)
-    cookie = kwargs.pop('cookie', None)
-    user_agent = kwargs.get('user_agent', None)
-    find = kwargs.pop('find', None)
-    query_type = kwargs.get('query_type', 'stock')
-    request_params = kwargs.get('request_params', {})
-    pro = kwargs.get('pro', False)
+    """获取每页数据。"""
+    retry = kwargs.pop("retry", REQUEST_CONFIG["page"]["retry"])
+    sleep = kwargs.pop("sleep", REQUEST_CONFIG["page"]["sleep"])
+    log = kwargs.pop("log", False)
+    strict = kwargs.pop("strict", False)
+    cookie = kwargs.pop("cookie", None)
+    user_agent = kwargs.get("user_agent", None)
+    find = kwargs.pop("find", None)
+    query_type = kwargs.get("query_type", "stock")
+    request_params = kwargs.get("request_params", {})
+    pro = kwargs.get("pro", False)
+
     if find is None:
-        data = {
-            **url_params,
-            'perpage': 100,
-            'page': 1,
-            **kwargs
-        }
+        data = {**url_params, "perpage": 100, "page": 1, **kwargs}
         target_url = LANDING_DATA_URL
         if pro:
-            target_url = f'{target_url}?iwcpro=1'
-        path = 'answer.components.0.data.datas'
+            target_url = f"{target_url}?iwcpro=1"
+        path = "answer.components.0.data.datas"
     else:
         if isinstance(find, List):
-            # 传入股票代码列表时，拼接
-            find = ','.join(find)
+            find = ",".join(find)
         data = {
-             **url_params,
-            'perpage': 100,
-            'page': 1,
-            'query_type': query_type,
-            'question': find,
-            **kwargs
+            **url_params,
+            "perpage": 100,
+            "page": 1,
+            "query_type": query_type,
+            "question": find,
+            **kwargs,
         }
         target_url = STOCK_PICK_FIND_URL
-        path = 'data.data.datas'
-    
-    log and _log_with_context(
-        "info",
-        '分页请求开始',
-        page=data.get("page"),
-        query=data.get("question") or kwargs.get("query") or kwargs.get("question"),
-        query_type=query_type,
-        target=target_url,
-        find=find,
-    )
+        path = "data.data.datas"
 
-    def do():
-        page_no = data.get("page", 1)
-        question = data.get('question') or kwargs.get('query') or kwargs.get('question')
-        request_context = {
-            "page": page_no,
-            "query": question,
-            "query_type": query_type,
-            "target": target_url,
-        }
-        req_headers = _build_request_headers(
-            question,
-            query_type=query_type,
-            cookie=cookie,
-            user_agent=user_agent,
-            # 分页主请求同样优先使用新 token，避免每次第一页先鉴权失败。
-            force_refresh_token=True,
-        )
-        try:
-            response_text = _request_text(
-                method='POST',
-                url=target_url,
-                headers_dict=req_headers,
-                timeout=REQUEST_CONFIG["page"]["timeout"],
-                request_params=request_params,
-                form_data=data,
-                log=log,
-                context=request_context,
-            )
-        except rq.exceptions.HTTPError as exc:
-            if not _is_auth_http_error(exc):
-                raise
-            log and _log_with_context(
-                "warning",
-                '分页请求首次鉴权失败，强制刷新token后重试一次',
-                **request_context,
-                status_code=getattr(getattr(exc, "response", None), "status_code", None),
-            )
-            reset_runtime_http_state()
-            refreshed_headers = _build_request_headers(
-                question,
-                query_type=query_type,
-                cookie=cookie,
-                user_agent=user_agent,
-                force_refresh_token=True,
-            )
-            logger.debug(f'刷新token后的请求头(脱敏): {_sanitize_headers_for_logging(refreshed_headers)}')
-            response_text = _request_text(
-                method='POST',
-                url=target_url,
-                headers_dict=refreshed_headers,
-                timeout=REQUEST_CONFIG["page"]["timeout"],
-                request_params=request_params,
-                form_data=data,
-                log=log,
-                context={**request_context, "token_refresh": "forced", "refresh_reason": "auth_error"},
-            )
-        try:
-            result_do = _load_json_response(response_text)
-        except WencaiUnexpectedResponseError:
-            log and _log_with_context("warning", '分页请求首次解析失败，强制刷新token后重试一次', **request_context)
-            refreshed_headers = _build_request_headers(
-                question,
-                query_type=query_type,
-                cookie=cookie,
-                user_agent=user_agent,
-                force_refresh_token=True,
-            )
-            logger.debug(f'刷新token后的请求头(脱敏): {_sanitize_headers_for_logging(refreshed_headers)}')
-            response_text = _request_text(
-                method='POST',
-                url=target_url,
-                headers_dict=refreshed_headers,
-                timeout=REQUEST_CONFIG["page"]["timeout"],
-                request_params=request_params,
-                form_data=data,
-                log=log,
-                context={**request_context, "token_refresh": "forced"},
-            )
-            result_do = _load_json_response(response_text)
-        data_list = _extract_data_list(result_do, path, page_no)
+    with _library_log_scope(log):
         log and _log_with_context(
             "info",
-            '分页请求成功',
-            page=page_no,
-            query=question,
-            query_type=query_type,
-            target=target_url,
-            rows=len(data_list),
-        )
-        return pd.DataFrame.from_dict(data_list)
-    
-    result = while_do(do, retry, sleep, log)
-
-    if result is None:
-        log and _log_with_context(
-            "error",
-            '分页请求失败',
+            "分页请求开始",
             page=data.get("page"),
             query=data.get("question") or kwargs.get("query") or kwargs.get("question"),
             query_type=query_type,
             target=target_url,
+            find=find,
         )
 
-    return result
+        def do():
+            page_no = data.get("page", 1)
+            question = data.get("question") or kwargs.get("query") or kwargs.get("question")
+            request_context = _build_request_context(
+                question=question,
+                query_type=query_type,
+                cookie=cookie,
+                user_agent=user_agent,
+                request_params=request_params,
+                log=log,
+                target=target_url,
+            )
+            request_context["page"] = page_no
+            req_headers, bucket_key = _build_runtime_headers(
+                question,
+                query_type=query_type,
+                cookie=cookie,
+                user_agent=user_agent,
+                request_params=request_params,
+                force_refresh_token=False,
+            )
+            request_context["bucket"] = format_token_bucket_label(bucket_key)
+            try:
+                response_text = _request_text(
+                    method="POST",
+                    url=target_url,
+                    headers_dict=req_headers,
+                    timeout=REQUEST_CONFIG["page"]["timeout"],
+                    request_params=request_params,
+                    form_data=data,
+                    log=log,
+                    context=request_context,
+                )
+            except rq.exceptions.HTTPError as exc:
+                if not _is_auth_http_error(exc):
+                    raise
+                log and _log_with_context(
+                    "warning",
+                    "分页请求首次鉴权失败，强制刷新token后重试一次",
+                    **request_context,
+                    status_code=getattr(getattr(exc, "response", None), "status_code", None),
+                )
+                reset_runtime_http_state()
+                refreshed_headers, refreshed_bucket_key = _build_runtime_headers(
+                    question,
+                    query_type=query_type,
+                    cookie=cookie,
+                    user_agent=user_agent,
+                    request_params=request_params,
+                    force_refresh_token=True,
+                )
+                refreshed_context = {
+                    **request_context,
+                    "token_refresh": "forced",
+                    "refresh_reason": "auth_error",
+                    "bucket": format_token_bucket_label(refreshed_bucket_key),
+                }
+                log and logger.debug(
+                    f"刷新token后的请求头(脱敏): {_sanitize_headers_for_logging(refreshed_headers)}"
+                )
+                response_text = _request_text(
+                    method="POST",
+                    url=target_url,
+                    headers_dict=refreshed_headers,
+                    timeout=REQUEST_CONFIG["page"]["timeout"],
+                    request_params=request_params,
+                    form_data=data,
+                    log=log,
+                    context=refreshed_context,
+                )
+
+            try:
+                result_payload = _load_json_response(response_text)
+            except WencaiUnexpectedResponseError:
+                log and _log_with_context(
+                    "warning",
+                    "分页请求首次解析失败，强制刷新token后重试一次",
+                    **request_context,
+                )
+                refreshed_headers, refreshed_bucket_key = _build_runtime_headers(
+                    question,
+                    query_type=query_type,
+                    cookie=cookie,
+                    user_agent=user_agent,
+                    request_params=request_params,
+                    force_refresh_token=True,
+                )
+                refreshed_context = {
+                    **request_context,
+                    "token_refresh": "forced",
+                    "refresh_reason": "parse_error",
+                    "bucket": format_token_bucket_label(refreshed_bucket_key),
+                }
+                log and logger.debug(
+                    f"刷新token后的请求头(脱敏): {_sanitize_headers_for_logging(refreshed_headers)}"
+                )
+                response_text = _request_text(
+                    method="POST",
+                    url=target_url,
+                    headers_dict=refreshed_headers,
+                    timeout=REQUEST_CONFIG["page"]["timeout"],
+                    request_params=request_params,
+                    form_data=data,
+                    log=log,
+                    context=refreshed_context,
+                )
+                result_payload = _load_json_response(response_text)
+
+            data_list = _extract_data_list(result_payload, path, page_no)
+            log and _log_with_context(
+                "info",
+                "分页请求成功",
+                page=page_no,
+                query=question,
+                query_type=query_type,
+                target=target_url,
+                rows=len(data_list),
+            )
+            return pd.DataFrame.from_dict(data_list)
+
+        result = while_do(
+            do,
+            retry=retry,
+            sleep=sleep,
+            log=log,
+            raise_last_exception=strict,
+        )
+        if result is None:
+            log and _log_with_context(
+                "error",
+                "分页请求失败",
+                page=data.get("page"),
+                query=data.get("question") or kwargs.get("query") or kwargs.get("question"),
+                query_type=query_type,
+                target=target_url,
+            )
+            if strict:
+                raise WencaiUnexpectedResponseError("分页请求返回None")
+        return result
 
 
 def can_loop(loop, count):
@@ -613,27 +736,31 @@ def can_loop(loop, count):
 
 
 def loop_page(loop, row_count, url_params, **kwargs):
-    '''循环分页'''
+    """循环分页。"""
     count = 0
-    perpage = kwargs.pop('perpage', 100)
+    strict = kwargs.get("strict", False)
+    perpage = kwargs.pop("perpage", 100)
     max_page = math.ceil(row_count / perpage)
     if max_page <= 0:
         return pd.DataFrame()
     result = None
-    if 'page' not in kwargs:
-        kwargs['page'] = 1
-    initPage = kwargs['page']
+    if "page" not in kwargs:
+        kwargs["page"] = 1
+    init_page = kwargs["page"]
     loop_count = max_page if loop is True else loop
     while can_loop(loop_count, count):
-        kwargs['page'] = initPage + count
-        resultPage = get_page(url_params, **kwargs)
-        count = count + 1
+        kwargs["page"] = init_page + count
+        result_page = get_page(url_params, **kwargs)
+        if result_page is None:
+            if strict:
+                raise WencaiUnexpectedResponseError("循环分页过程中页面请求失败")
+            return pd.DataFrame()
+        count += 1
         if result is None:
-            result = resultPage
+            result = result_page
         else:
-            result = pd.concat([result, resultPage], ignore_index=True)
-
-    return result
+            result = pd.concat([result, result_page], ignore_index=True)
+    return result if result is not None else pd.DataFrame()
 
 
 def _normalize_get_kwargs(kwargs):
@@ -642,71 +769,88 @@ def _normalize_get_kwargs(kwargs):
 
 def _extract_dataframe_from_data(data, log=False):
     if isinstance(data, pd.DataFrame):
-        log and logger.info(f'data是DataFrame，直接返回，形状: {data.shape}')
+        log and logger.info(f"data是DataFrame，直接返回，形状: {data.shape}")
         return data
     if isinstance(data, dict):
-        log and logger.info(f'data是字典，尝试提取DataFrame，字典键: {list(data.keys())}')
+        log and logger.info(f"data是字典，尝试提取DataFrame，字典键: {list(data.keys())}")
         for key, value in data.items():
             if isinstance(value, pd.DataFrame):
-                log and logger.info(f'从字典中提取到DataFrame，键: {key}，形状: {value.shape}')
+                log and logger.info(f"从字典中提取到DataFrame，键: {key}，形状: {value.shape}")
                 return value
-    log and logger.warning('data既不是DataFrame也不是包含DataFrame的字典，返回空DataFrame')
+    log and logger.warning("data既不是DataFrame也不是包含DataFrame的字典，返回空DataFrame")
     return pd.DataFrame()
 
 
-def _fetch_result_dataframe(params, loop=False, log=False, **kwargs):
-    data = params.get('data')
-    url_params = params.get('url_params')
-    condition = _.get(data, 'condition')
+def _fetch_result_dataframe(params, loop=False, log=False, strict=False, **kwargs):
+    data = params.get("data")
+    url_params = params.get("url_params")
+    condition = _.get(data, "condition")
 
     log and logger.info(
-        f'get_robot_data返回数据: data类型={type(data)}, url_params={url_params}, condition={condition}'
+        f"get_robot_data返回数据: data类型={type(data)}, url_params={url_params}, condition={condition}"
     )
-    log and logger.debug(f'get_robot_data完整返回: {params}')
+    log and logger.debug(f"get_robot_data完整返回: {params}")
 
     if condition is not None:
         page_kwargs = {**kwargs, **data}
-        find = page_kwargs.get('find', None)
+        find = page_kwargs.get("find", None)
         if loop and find is None:
-            row_count = params.get('row_count', 0)
-            log and logger.info(f'开始循环分页，总条数: {row_count}')
+            row_count = params.get("row_count", 0)
+            log and logger.info(f"开始循环分页，总条数: {row_count}")
             if not row_count:
-                log and logger.info('循环分页总条数为0，直接返回空DataFrame')
+                log and logger.info("循环分页总条数为0，直接返回空DataFrame")
                 return pd.DataFrame()
-            result = loop_page(loop, row_count, url_params, **page_kwargs)
-            log and logger.info(f'循环分页完成，返回结果形状: {result.shape if result is not None else "None"}')
+            result = loop_page(loop, row_count, url_params, strict=strict, log=log, **page_kwargs)
+            if result is None:
+                if strict:
+                    raise WencaiUnexpectedResponseError("循环分页返回None")
+                return pd.DataFrame()
+            log and logger.info(f"循环分页完成，返回结果形状: {result.shape}")
             return result
 
-        log and logger.info('开始获取单页数据')
-        result = get_page(url_params, **page_kwargs)
-        log and logger.info(f'获取单页数据完成，返回结果形状: {result.shape if result is not None else "None"}')
+        log and logger.info("开始获取单页数据")
+        result = get_page(url_params, strict=strict, log=log, **page_kwargs)
+        if result is None:
+            if strict:
+                raise WencaiUnexpectedResponseError("单页请求返回None")
+            return pd.DataFrame()
+        log and logger.info(f"获取单页数据完成，返回结果形状: {result.shape}")
         return result
 
-    no_detail = kwargs.get('no_detail')
-    if no_detail is not True:
+    if kwargs.get("no_detail") is not True:
         return _extract_dataframe_from_data(data, log=log)
 
-    log and logger.info('no_detail=True，返回空DataFrame')
+    log and logger.info("no_detail=True，返回空DataFrame")
     return pd.DataFrame()
 
 
 def get(loop=False, **kwargs):
-    '''获取结果'''
-    try:
-        kwargs = _normalize_get_kwargs(kwargs)
-        log = kwargs.get('log', True)  # 默认开启日志
-        log and logger.info(f'开始执行get函数，查询: {kwargs.get("query")}')
-        
-        params = get_robot_data(**kwargs)
-        
-        # 确保params不为None
-        if params is None:
-            log and logger.error(f'get_robot_data返回None')
+    """获取结果。"""
+    kwargs = _normalize_get_kwargs(kwargs)
+    log = kwargs.get("log", True)
+    strict = kwargs.get("strict", False)
+    with _library_log_scope(log):
+        try:
+            log and logger.info(f"开始执行get函数，查询: {kwargs.get('query')}")
+            params = get_robot_data(**kwargs)
+            if params is None:
+                if strict:
+                    raise WencaiUnexpectedResponseError("get_robot_data返回None")
+                log and logger.error("get_robot_data返回None")
+                return pd.DataFrame()
+
+            fetch_kwargs = dict(kwargs)
+            fetch_kwargs.pop("log", None)
+            fetch_kwargs.pop("strict", None)
+            return _fetch_result_dataframe(
+                params,
+                loop=loop,
+                log=log,
+                strict=strict,
+                **fetch_kwargs,
+            )
+        except Exception as exc:
+            if strict:
+                raise
+            log and logger.error(f"get函数执行失败: {exc}", exc_info=True)
             return pd.DataFrame()
-        fetch_kwargs = dict(kwargs)
-        fetch_kwargs.pop("log", None)
-        return _fetch_result_dataframe(params, loop=loop, log=log, **fetch_kwargs)
-    except Exception as e:
-        # 捕获所有异常，确保函数不会崩溃
-        logger.error(f'get函数执行失败: {e}', exc_info=True)
-        return pd.DataFrame()

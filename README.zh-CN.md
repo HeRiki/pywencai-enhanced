@@ -18,10 +18,11 @@
 相对原始的 `pywencai 0.7.1`，这个版本主要强化了稳定性和工程化能力：
 
 - 全链路统一使用 HTTPS 接口。
-- 复用 HTTP session，避免每次请求都重新建立一套链路。
+- 复用 HTTP session 和短期 token 分桶，避免每次请求都重新建立一套链路。
 - 针对超时、连接错误、`429` 和服务端异常提供更稳的重试策略。
 - 能识别问财返回 HTML/article 页面并强制刷新 token 后重试。
 - 在 `401` / `403` 鉴权失败时自动刷新 token。
+- 嵌套跟进请求会继承顶层 cookie、User-Agent 和显式代理设置，不再走另一套上下文。
 - 仓库内直接附带 `hexin-v.bundle.js`，普通用户不需要额外执行 `npm install`。
 - 支持更丰富的 `get-robot-data` 解析和更多 `show_type` 场景。
 - 带有独立的 fixture 单测，覆盖 token 刷新、重试行为和解析兼容性。
@@ -37,7 +38,7 @@ pip install git+https://github.com/HeRiki/pywencai-enhanced.git
 按 tag 安装指定版本：
 
 ```bash
-pip install git+https://github.com/HeRiki/pywencai-enhanced.git@v0.1.2
+pip install git+https://github.com/HeRiki/pywencai-enhanced.git@v0.2.0
 ```
 
 本地开发安装：
@@ -56,6 +57,7 @@ df = pywencai.get(
     query_type="stock",
     cookie="你的问财 cookie",
     log=True,
+    strict=False,
 )
 
 print(df.head())
@@ -70,6 +72,16 @@ df = pywencai.get(
     question="退市股票",
     sort_key="退市@退市日期",
     sort_order="asc",
+)
+```
+
+如果你希望请求、鉴权、解析失败时直接抛异常，而不是回退为空 `DataFrame`，可以开启严格模式：
+
+```python
+df = pywencai.get(
+    query="十日涨幅前10",
+    cookie="你的问财 cookie",
+    strict=True,
 )
 ```
 
@@ -91,6 +103,7 @@ df = pywencai.get(
 - `retry`
 - `sleep`
 - `log`
+- `strict`
 - `request_params`
 - `pro`
 - `find`
@@ -102,6 +115,21 @@ df = pywencai.get(
 - 普通使用者不需要执行 `npm install`，因为仓库已经带了构建好的 `hexin-v.bundle.js`。
 - 为了获得更稳定的 token 生成能力，运行环境仍推荐安装 Node.js。
 - 如果没有 Node.js，包会回退到 Python 生成 token；这个回退路径可以用，但稳定性可能不如 Node 方案。
+- token 只会在同一短生命周期请求桶内复用，请求桶由 `cookie + 解析后的 User-Agent + 显式代理身份` 组成；切账号、切 UA、切显式代理时会自动换桶。
+- 嵌套跟进请求会继承顶层 `cookie`、`user_agent` 和显式 `request_params`，包括 `proxies`、`verify`、`allow_redirects`。
+
+## 日志
+
+- `log=True` 时保留请求链路日志。
+- `log=False` 时库内部保持静默，包含鉴权重试和解析重试路径。
+- 宿主应用如果想把日志并入自己的 logger，可以这样接：
+
+```python
+import logging
+import pywencai
+
+pywencai.configure_logger(logging.getLogger("my-app"))
+```
 
 ## 维护者工作流
 
@@ -125,7 +153,7 @@ npx webpack --config webpack.config.js
 独立包测试命令：
 
 ```bash
-python -m unittest tests.test_pywencai
+PYTHONPATH=src python -m unittest tests.test_pywencai
 ```
 
 ## 致谢与来源

@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pywencai-enhanced"
-version = "0.1.2"
-description = "Enhanced fork of pywencai with stronger auth refresh, retries, and parsing."
+version = "0.2.0"
+description = "Enhanced fork of pywencai with token-bucket auth reuse, stronger retries, and resilient parsing."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"

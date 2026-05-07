@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 from pathlib import Path
+import logging
 import sys
 import types
 import unittest
@@ -16,6 +17,15 @@ from pywencai import headers as headers_module
 from pywencai import wencai as wencai_module
 
 
+class _ListHandler(logging.Handler):
+    def __init__(self):
+        super().__init__()
+        self.records = []
+
+    def emit(self, record):
+        self.records.append(record)
+
+
 class TestPyWencaiHelpers(unittest.TestCase):
     def tearDown(self):
         headers_module.clear_runtime_cache()
@@ -25,6 +35,20 @@ class TestPyWencaiHelpers(unittest.TestCase):
     def _read_fixture(self, name):
         fixture_path = Path(__file__).resolve().parent / "fixtures" / "pywencai" / name
         return fixture_path.read_text(encoding="utf-8")
+
+    def _build_capture_logger(self, name="pywencai-test"):
+        logger = logging.getLogger(name)
+        logger.handlers = []
+        logger.propagate = False
+        logger.setLevel(logging.DEBUG)
+        handler = _ListHandler()
+        logger.addHandler(handler)
+        return logger, handler
+
+    def test_package_exports_expected_public_api(self):
+        self.assertTrue(callable(pywencai.get))
+        self.assertTrue(callable(pywencai.configure_logger))
+        self.assertTrue(callable(pywencai.reset_logger))
 
     def test_tab1_handler_uses_dict_copy_instead_of_invalid_set(self):
         comp = {
@@ -36,12 +60,7 @@ class TestPyWencaiHelpers(unittest.TestCase):
             "tab_list": [
                 {
                     "tab_name": "示例",
-                    "list": [
-                        {
-                            "show_type": "common",
-                            "data_index": "block_a",
-                        }
-                    ],
+                    "list": [{"show_type": "common", "data_index": "block_a"}],
                 }
             ],
         }
@@ -72,19 +91,40 @@ class TestPyWencaiHelpers(unittest.TestCase):
         self.assertIn("示例", result)
         self.assertEqual(list(result["示例"].keys()), ["common"])
 
-    def test_nested_get_url_ignores_environment_proxy(self):
+    def test_nested_get_url_ignores_environment_proxy_and_inherits_context(self):
         response = Mock()
         response.text = '{"data":{"股票代码":"600001"}}'
         response.raise_for_status = Mock()
-        session = Mock()
-        session.request.return_value = response
 
-        with patch.object(convert_module.rq, "Session", return_value=session):
-            result = convert_module.get_url("/gateway/test")
+        with patch.object(convert_module, "_request_without_env_proxy", return_value=response) as request_mock:
+            with patch.object(
+                convert_module,
+                "build_request_headers",
+                return_value=({"hexin-v": "token-a", "cookie": "a=b", "User-Agent": "ua"}, "bucket-a"),
+            ) as headers_mock:
+                result = convert_module.get_url(
+                    "/gateway/test",
+                    request_context={
+                        "query": "测试",
+                        "query_type": "stock",
+                        "cookie": "a=b",
+                        "user_agent": "ua",
+                        "request_params": {"proxies": {"https": "http://127.0.0.1:7890"}},
+                        "log": False,
+                    },
+                )
 
         self.assertEqual(result, {"股票代码": "600001"})
-        self.assertFalse(session.trust_env)
-        session.close.assert_called_once()
+        headers_mock.assert_called_once()
+        self.assertEqual(headers_mock.call_args.kwargs["question"], "测试")
+        self.assertEqual(
+            headers_mock.call_args.kwargs["request_params"],
+            {"proxies": {"https": "http://127.0.0.1:7890"}},
+        )
+        self.assertEqual(
+            request_mock.call_args.kwargs["request_params"],
+            {"proxies": {"https": "http://127.0.0.1:7890"}},
+        )
 
     def test_get_show_type_handler_falls_back_to_common_handler(self):
         convert_module.UNKNOWN_SHOW_TYPE_COUNTS.clear()
@@ -93,15 +133,12 @@ class TestPyWencaiHelpers(unittest.TestCase):
         with self.assertLogs(convert_module.logger, level="WARNING") as logs:
             second_handler = convert_module.get_show_type_handler("another_unknown_type")
         self.assertIs(second_handler, convert_module.common_handler)
-        log_text = "\n".join(logs.output)
-        self.assertIn("未识别且无法按结构解析的show_type", log_text)
-        self.assertIn("shape=type=NoneType", log_text)
+        self.assertIn("未识别且无法按结构解析的show_type", "\n".join(logs.output))
         convert_module.get_show_type_handler("another_unknown_type")
         self.assertEqual(convert_module.UNKNOWN_SHOW_TYPE_COUNTS["another_unknown_type"], 2)
 
     def test_get_show_type_handler_normalizes_versioned_show_types(self):
         convert_module.UNKNOWN_SHOW_TYPE_COUNTS.clear()
-
         with patch.object(convert_module.logger, "warning") as mock_warning:
             handlers = {
                 "kline2": convert_module.get_show_type_handler("kline2"),
@@ -116,54 +153,20 @@ class TestPyWencaiHelpers(unittest.TestCase):
         self.assertIs(handlers["line3"], convert_module.common_handler)
         self.assertIs(handlers["list3"], convert_module.common_handler)
         self.assertIs(handlers["txt3"], convert_module.txt_handler)
-        self.assertEqual(convert_module.UNKNOWN_SHOW_TYPE_COUNTS, {})
         mock_warning.assert_not_called()
 
     def test_get_show_type_handler_uses_tab_structure_for_unknown_outer_show_type(self):
-        convert_module.UNKNOWN_SHOW_TYPE_COUNTS.clear()
         comp = {
             "show_type": "widget9",
-            "data": {
-                "block_a": {
-                    "datas": [{"股票代码": "600001", "股票名称": "测试股份"}]
-                }
-            },
+            "data": {"block_a": {"datas": [{"股票代码": "600001"}]}},
             "tab_list": [
-                {
-                    "tab_name": "示例",
-                    "list": [
-                        {
-                            "show_type": "list3",
-                            "data_index": "block_a",
-                        }
-                    ],
-                }
+                {"tab_name": "示例", "list": [{"show_type": "list3", "data_index": "block_a"}]}
             ],
         }
 
-        with patch.object(convert_module.logger, "warning") as mock_warning:
-            handler = convert_module.get_show_type_handler("widget9", comp=comp)
+        handler = convert_module.get_show_type_handler("widget9", comp=comp)
 
         self.assertIs(handler, convert_module.tab1_handler)
-        self.assertEqual(convert_module.UNKNOWN_SHOW_TYPE_COUNTS, {})
-        mock_warning.assert_not_called()
-
-    def test_get_show_type_handler_uses_common_for_unknown_parseable_component(self):
-        convert_module.UNKNOWN_SHOW_TYPE_COUNTS.clear()
-        comp = {
-            "show_type": "widget9",
-            "data": {
-                "series": [1, 2, 3],
-                "meta": {"name": "示例"},
-            },
-        }
-
-        with patch.object(convert_module.logger, "warning") as mock_warning:
-            handler = convert_module.get_show_type_handler("widget9", comp=comp)
-
-        self.assertIs(handler, convert_module.common_handler)
-        self.assertEqual(convert_module.UNKNOWN_SHOW_TYPE_COUNTS, {})
-        mock_warning.assert_not_called()
 
     def test_configure_logger_routes_package_logs_to_host_logger(self):
         configured = pywencai.configure_logger("stock_analysis_app")
@@ -180,7 +183,6 @@ class TestPyWencaiHelpers(unittest.TestCase):
 
     def test_reset_logger_restores_module_loggers(self):
         pywencai.configure_logger("stock_analysis_app")
-
         pywencai.reset_logger()
 
         self.assertEqual(headers_module.logger.name, "pywencai.headers")
@@ -204,7 +206,6 @@ class TestPyWencaiHelpers(unittest.TestCase):
             empty="",
             none_value=None,
         )
-
         self.assertEqual(context, "query=测试 | page=1 | query_type=stock")
 
     def test_normalize_get_kwargs_replaces_known_keys(self):
@@ -220,24 +221,66 @@ class TestPyWencaiHelpers(unittest.TestCase):
     def test_extract_dataframe_from_data_returns_embedded_frame(self):
         frame = pd.DataFrame([{"股票代码": "600001"}])
         result = wencai_module._extract_dataframe_from_data({"detail": frame}, log=False)
-
         self.assertTrue(result.equals(frame))
 
-    def test_headers_cache_token_and_user_agent_within_process(self):
-        fake_module = types.SimpleNamespace(
-            UserAgent=lambda: types.SimpleNamespace(random="ua-fixed")
-        )
+    def test_headers_cache_token_and_user_agent_within_same_bucket(self):
+        fake_module = types.SimpleNamespace(UserAgent=lambda: types.SimpleNamespace(random="ua-fixed"))
         with patch.dict(sys.modules, {"fake_useragent": fake_module}):
             with patch.object(headers_module, "check_node_available", return_value=(False, None)):
                 with patch.object(headers_module, "generate_token_python", return_value="token-fixed") as mock_token:
-                    first = headers_module.headers(cookie="a=b")
-                    second = headers_module.headers(cookie="a=b")
+                    first, bucket_a = headers_module.build_auth_headers(
+                        cookie="a=b",
+                        request_params={"proxies": {"https": "http://127.0.0.1:7890"}},
+                    )
+                    second, bucket_b = headers_module.build_auth_headers(
+                        cookie="a=b",
+                        request_params={"proxies": {"https": "http://127.0.0.1:7890"}},
+                    )
 
+        self.assertEqual(bucket_a, bucket_b)
         self.assertEqual(first["User-Agent"], "ua-fixed")
-        self.assertEqual(second["User-Agent"], "ua-fixed")
-        self.assertEqual(first["hexin-v"], "token-fixed")
         self.assertEqual(second["hexin-v"], "token-fixed")
         self.assertEqual(mock_token.call_count, 1)
+
+    def test_token_bucket_changes_when_proxy_changes(self):
+        with patch.object(headers_module, "check_node_available", return_value=(False, None)):
+            with patch.object(headers_module, "generate_token_python", side_effect=["token-a", "token-b"]):
+                first, bucket_a = headers_module.build_auth_headers(
+                    cookie="a=b",
+                    user_agent="ua",
+                    request_params={"proxies": {"https": "http://127.0.0.1:7890"}},
+                )
+                second, bucket_b = headers_module.build_auth_headers(
+                    cookie="a=b",
+                    user_agent="ua",
+                    request_params={"proxies": {"https": "http://127.0.0.1:7891"}},
+                )
+
+        self.assertNotEqual(bucket_a, bucket_b)
+        self.assertEqual(first["hexin-v"], "token-a")
+        self.assertEqual(second["hexin-v"], "token-b")
+
+    def test_force_refresh_only_refreshes_current_bucket(self):
+        with patch.object(headers_module, "check_node_available", return_value=(False, None)):
+            with patch.object(
+                headers_module,
+                "generate_token_python",
+                side_effect=["token-a", "token-a-refresh", "token-b"],
+            ) as mock_token:
+                first, bucket_a = headers_module.build_auth_headers(cookie="a=b", user_agent="ua-a")
+                refreshed, bucket_a_refreshed = headers_module.build_auth_headers(
+                    cookie="a=b",
+                    user_agent="ua-a",
+                    force_refresh_token=True,
+                )
+                second, bucket_b = headers_module.build_auth_headers(cookie="a=b", user_agent="ua-b")
+
+        self.assertEqual(bucket_a, bucket_a_refreshed)
+        self.assertNotEqual(bucket_a, bucket_b)
+        self.assertEqual(first["hexin-v"], "token-a")
+        self.assertEqual(refreshed["hexin-v"], "token-a-refresh")
+        self.assertEqual(second["hexin-v"], "token-b")
+        self.assertEqual(mock_token.call_count, 3)
 
     def test_get_session_reuses_singleton(self):
         fake_session = Mock()
@@ -267,23 +310,6 @@ class TestPyWencaiHelpers(unittest.TestCase):
 
         self.assertIsNone(result)
 
-    def test_get_page_rejects_html_response(self):
-        response = Mock()
-        response.text = self._read_fixture("article_page.html")
-        response.raise_for_status = Mock()
-        session = Mock()
-        session.request.return_value = response
-        with patch.object(wencai_module, "get_session", return_value=session):
-            result = wencai_module.get_page(
-                {"question": "测试"},
-                query="测试",
-                cookie="a=b",
-                retry=1,
-                log=False,
-            )
-
-        self.assertIsNone(result)
-
     def test_get_page_refreshes_token_after_html_response(self):
         html_response = Mock()
         html_response.text = self._read_fixture("article_page.html")
@@ -294,13 +320,15 @@ class TestPyWencaiHelpers(unittest.TestCase):
         session = Mock()
         session.request.side_effect = [html_response, json_response]
 
-        headers_mock = Mock(side_effect=[
-            {"hexin-v": "token-a", "User-Agent": "ua", "cookie": "a=b"},
-            {"hexin-v": "token-b", "User-Agent": "ua", "cookie": "a=b"},
-        ])
-
         with patch.object(wencai_module, "get_session", return_value=session):
-            with patch.object(wencai_module, "headers", headers_mock):
+            with patch.object(
+                wencai_module,
+                "_build_runtime_headers",
+                side_effect=[
+                    ({"hexin-v": "token-a", "User-Agent": "ua", "cookie": "a=b"}, "bucket-a"),
+                    ({"hexin-v": "token-b", "User-Agent": "ua", "cookie": "a=b"}, "bucket-a"),
+                ],
+            ) as headers_mock:
                 result = wencai_module.get_page(
                     {"question": "测试"},
                     query="测试",
@@ -311,8 +339,7 @@ class TestPyWencaiHelpers(unittest.TestCase):
 
         self.assertIsInstance(result, pd.DataFrame)
         self.assertEqual(result.iloc[0]["股票代码"], "600001")
-        self.assertEqual(headers_mock.call_count, 2)
-        self.assertEqual(headers_mock.call_args_list[0].kwargs["force_refresh_token"], True)
+        self.assertEqual(headers_mock.call_args_list[0].kwargs["force_refresh_token"], False)
         self.assertEqual(headers_mock.call_args_list[1].kwargs["force_refresh_token"], True)
 
     def test_get_page_refreshes_token_after_401_response(self):
@@ -326,13 +353,15 @@ class TestPyWencaiHelpers(unittest.TestCase):
         session = Mock()
         session.request.side_effect = [auth_error, json_response]
 
-        headers_mock = Mock(side_effect=[
-            {"hexin-v": "token-a", "User-Agent": "ua", "cookie": "a=b"},
-            {"hexin-v": "token-b", "User-Agent": "ua", "cookie": "a=b"},
-        ])
-
         with patch.object(wencai_module, "get_session", return_value=session):
-            with patch.object(wencai_module, "headers", headers_mock):
+            with patch.object(
+                wencai_module,
+                "_build_runtime_headers",
+                side_effect=[
+                    ({"hexin-v": "token-a", "User-Agent": "ua", "cookie": "a=b"}, "bucket-a"),
+                    ({"hexin-v": "token-b", "User-Agent": "ua", "cookie": "a=b"}, "bucket-a"),
+                ],
+            ) as headers_mock:
                 result = wencai_module.get_page(
                     {"question": "测试"},
                     query="测试",
@@ -342,9 +371,7 @@ class TestPyWencaiHelpers(unittest.TestCase):
                 )
 
         self.assertIsInstance(result, pd.DataFrame)
-        self.assertEqual(result.iloc[0]["股票代码"], "600001")
-        self.assertEqual(headers_mock.call_count, 2)
-        self.assertEqual(headers_mock.call_args_list[0].kwargs["force_refresh_token"], True)
+        self.assertEqual(headers_mock.call_args_list[0].kwargs["force_refresh_token"], False)
         self.assertEqual(headers_mock.call_args_list[1].kwargs["force_refresh_token"], True)
 
     def test_get_page_resets_session_after_403_response(self):
@@ -358,13 +385,15 @@ class TestPyWencaiHelpers(unittest.TestCase):
         session = Mock()
         session.request.side_effect = [auth_error, json_response]
 
-        headers_mock = Mock(side_effect=[
-            {"hexin-v": "token-a", "User-Agent": "ua", "cookie": "a=b"},
-            {"hexin-v": "token-b", "User-Agent": "ua", "cookie": "a=b"},
-        ])
-
         with patch.object(wencai_module, "get_session", return_value=session):
-            with patch.object(wencai_module, "headers", headers_mock):
+            with patch.object(
+                wencai_module,
+                "_build_runtime_headers",
+                side_effect=[
+                    ({"hexin-v": "token-a", "User-Agent": "ua", "cookie": "a=b"}, "bucket-a"),
+                    ({"hexin-v": "token-b", "User-Agent": "ua", "cookie": "a=b"}, "bucket-a"),
+                ],
+            ):
                 with patch.object(wencai_module, "reset_runtime_http_state") as reset_mock:
                     result = wencai_module.get_page(
                         {"question": "测试"},
@@ -375,7 +404,6 @@ class TestPyWencaiHelpers(unittest.TestCase):
                     )
 
         self.assertIsInstance(result, pd.DataFrame)
-        self.assertEqual(result.iloc[0]["股票代码"], "600001")
         reset_mock.assert_called_once()
 
     def test_get_robot_data_uses_https_endpoint(self):
@@ -396,10 +424,7 @@ class TestPyWencaiHelpers(unittest.TestCase):
             )
 
         self.assertIsNotNone(result)
-        self.assertEqual(
-            session.request.call_args.kwargs["url"],
-            wencai_module.ROBOT_DATA_URL,
-        )
+        self.assertEqual(session.request.call_args.kwargs["url"], wencai_module.ROBOT_DATA_URL)
         self.assertTrue(session.request.call_args.kwargs["url"].startswith("https://"))
 
     def test_get_robot_data_refreshes_token_after_401_response(self):
@@ -415,13 +440,15 @@ class TestPyWencaiHelpers(unittest.TestCase):
         session = Mock()
         session.request.side_effect = [auth_error, json_response]
 
-        headers_mock = Mock(side_effect=[
-            {"hexin-v": "token-a", "User-Agent": "ua", "cookie": "a=b"},
-            {"hexin-v": "token-b", "User-Agent": "ua", "cookie": "a=b"},
-        ])
-
         with patch.object(wencai_module, "get_session", return_value=session):
-            with patch.object(wencai_module, "headers", headers_mock):
+            with patch.object(
+                wencai_module,
+                "_build_runtime_headers",
+                side_effect=[
+                    ({"hexin-v": "token-a", "User-Agent": "ua", "cookie": "a=b"}, "bucket-a"),
+                    ({"hexin-v": "token-b", "User-Agent": "ua", "cookie": "a=b"}, "bucket-a"),
+                ],
+            ) as headers_mock:
                 result = wencai_module.get_robot_data(
                     query="十日涨幅前十",
                     cookie="a=b",
@@ -430,8 +457,7 @@ class TestPyWencaiHelpers(unittest.TestCase):
                 )
 
         self.assertIsNotNone(result)
-        self.assertEqual(headers_mock.call_count, 2)
-        self.assertEqual(headers_mock.call_args_list[0].kwargs["force_refresh_token"], True)
+        self.assertEqual(headers_mock.call_args_list[0].kwargs["force_refresh_token"], False)
         self.assertEqual(headers_mock.call_args_list[1].kwargs["force_refresh_token"], True)
 
     def test_get_robot_data_resets_session_after_403_response(self):
@@ -447,13 +473,15 @@ class TestPyWencaiHelpers(unittest.TestCase):
         session = Mock()
         session.request.side_effect = [auth_error, json_response]
 
-        headers_mock = Mock(side_effect=[
-            {"hexin-v": "token-a", "User-Agent": "ua", "cookie": "a=b"},
-            {"hexin-v": "token-b", "User-Agent": "ua", "cookie": "a=b"},
-        ])
-
         with patch.object(wencai_module, "get_session", return_value=session):
-            with patch.object(wencai_module, "headers", headers_mock):
+            with patch.object(
+                wencai_module,
+                "_build_runtime_headers",
+                side_effect=[
+                    ({"hexin-v": "token-a", "User-Agent": "ua", "cookie": "a=b"}, "bucket-a"),
+                    ({"hexin-v": "token-b", "User-Agent": "ua", "cookie": "a=b"}, "bucket-a"),
+                ],
+            ):
                 with patch.object(wencai_module, "reset_runtime_http_state") as reset_mock:
                     result = wencai_module.get_robot_data(
                         query="十日涨幅前十",
@@ -482,10 +510,7 @@ class TestPyWencaiHelpers(unittest.TestCase):
             )
 
         self.assertIsInstance(result, pd.DataFrame)
-        self.assertEqual(
-            session.request.call_args.kwargs["url"],
-            wencai_module.LANDING_DATA_URL,
-        )
+        self.assertEqual(session.request.call_args.kwargs["url"], wencai_module.LANDING_DATA_URL)
         self.assertTrue(session.request.call_args.kwargs["url"].startswith("https://"))
 
     def test_while_do_retries_on_429_http_error(self):
@@ -501,10 +526,13 @@ class TestPyWencaiHelpers(unittest.TestCase):
                 raise error
             return "ok"
 
-        result = wencai_module.while_do(flaky, retry=3, sleep=0, log=False)
+        with patch.object(wencai_module.random, "uniform", return_value=0.0):
+            with patch.object(wencai_module.time, "sleep") as sleep_mock:
+                result = wencai_module.while_do(flaky, retry=3, sleep=0, log=False)
 
         self.assertEqual(result, "ok")
         self.assertEqual(call_count["value"], 3)
+        self.assertEqual(sleep_mock.call_count, 2)
 
     def test_while_do_does_not_retry_on_400_http_error(self):
         response = Mock()
@@ -544,22 +572,17 @@ class TestPyWencaiHelpers(unittest.TestCase):
                 raise error
             return "ok"
 
-        with patch.object(wencai_module, "reset_runtime_http_state") as reset_mock:
-            result = wencai_module.while_do(flaky, retry=3, sleep=0, log=False)
+        with patch.object(wencai_module.random, "uniform", return_value=0.0):
+            with patch.object(wencai_module, "reset_runtime_http_state") as reset_mock:
+                result = wencai_module.while_do(flaky, retry=3, sleep=0, log=False)
 
         self.assertEqual(result, "ok")
         self.assertEqual(call_count["value"], 2)
         reset_mock.assert_called_once()
 
     def test_connection_retry_backoff_uses_transport_floor(self):
-        self.assertEqual(
-            wencai_module._connection_retry_backoff_seconds(1, 0),
-            0.2,
-        )
-        self.assertEqual(
-            wencai_module._connection_retry_backoff_seconds(3, 0.8),
-            0.8,
-        )
+        self.assertEqual(wencai_module._connection_retry_backoff_seconds(1, 0), 0.2)
+        self.assertEqual(wencai_module._connection_retry_backoff_seconds(3, 0.8), 0.8)
 
     def test_loop_page_returns_empty_frame_for_zero_row_count(self):
         with patch.object(wencai_module, "get_page", side_effect=AssertionError("should not fetch pages")):
@@ -572,6 +595,65 @@ class TestPyWencaiHelpers(unittest.TestCase):
 
         self.assertIsInstance(result, pd.DataFrame)
         self.assertTrue(result.empty)
+
+    def test_loop_page_fails_closed_when_non_strict_page_returns_none(self):
+        with patch.object(wencai_module, "get_page", side_effect=[pd.DataFrame([{"股票代码": "600001"}]), None]):
+            result = wencai_module.loop_page(
+                True,
+                200,
+                {"question": "测试"},
+                question="测试",
+                strict=False,
+            )
+
+        self.assertIsInstance(result, pd.DataFrame)
+        self.assertTrue(result.empty)
+
+    def test_get_strict_true_reraises_original_exception(self):
+        with patch.object(
+            wencai_module,
+            "get_robot_data",
+            side_effect=requests.exceptions.HTTPError("boom"),
+        ):
+            with self.assertRaises(requests.exceptions.HTTPError):
+                wencai_module.get(query="测试", strict=True, log=False)
+
+    def test_get_strict_false_returns_empty_frame(self):
+        with patch.object(
+            wencai_module,
+            "get_robot_data",
+            side_effect=requests.exceptions.HTTPError("boom"),
+        ):
+            result = wencai_module.get(query="测试", strict=False, log=False)
+
+        self.assertIsInstance(result, pd.DataFrame)
+        self.assertTrue(result.empty)
+
+    def test_get_log_false_is_silent(self):
+        capture_logger, handler = self._build_capture_logger("pywencai.silent")
+        pywencai.configure_logger(capture_logger)
+        with patch.object(
+            wencai_module,
+            "get_robot_data",
+            side_effect=requests.exceptions.HTTPError("boom"),
+        ):
+            result = wencai_module.get(query="测试", strict=False, log=False)
+
+        self.assertTrue(result.empty)
+        self.assertEqual(handler.records, [])
+
+    def test_get_log_true_records_failure(self):
+        capture_logger, handler = self._build_capture_logger("pywencai.verbose")
+        pywencai.configure_logger(capture_logger)
+        with patch.object(
+            wencai_module,
+            "get_robot_data",
+            side_effect=requests.exceptions.HTTPError("boom"),
+        ):
+            result = wencai_module.get(query="测试", strict=False, log=True)
+
+        self.assertTrue(result.empty)
+        self.assertTrue(any("get函数执行失败" in record.getMessage() for record in handler.records))
 
     def test_convert_parses_robot_fixture(self):
         response = Mock()

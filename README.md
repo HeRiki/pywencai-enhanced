@@ -18,10 +18,11 @@ This project is maintained as an enhanced derivative of [`zsrl/pywencai`](https:
 Compared with the original `pywencai 0.7.1`, this fork focuses on runtime stability and maintainability:
 
 - Uses HTTPS endpoints throughout.
-- Reuses HTTP sessions instead of creating a fresh request flow every time.
+- Reuses HTTP sessions and short-lived token buckets instead of creating a fresh request flow every time.
 - Retries more safely for timeouts, connection errors, `429`, and server-side failures.
 - Detects HTML/article-page fallbacks and retries after forcing a fresh token.
 - Forces token refresh after `401` or `403` authentication failures.
+- Keeps nested follow-up requests on the same request context, including cookie, User-Agent, and explicit proxy settings.
 - Ships a checked-in `hexin-v.bundle.js` so normal users do not need to run `npm install`.
 - Supports richer `get-robot-data` parsing and more `show_type` variants.
 - Includes standalone fixture-driven tests for token refresh, retry behavior, and parser compatibility.
@@ -37,7 +38,7 @@ pip install git+https://github.com/HeRiki/pywencai-enhanced.git
 Install a tagged release:
 
 ```bash
-pip install git+https://github.com/HeRiki/pywencai-enhanced.git@v0.1.2
+pip install git+https://github.com/HeRiki/pywencai-enhanced.git@v0.2.0
 ```
 
 For local development:
@@ -56,6 +57,7 @@ df = pywencai.get(
     query_type="stock",
     cookie="your iwencai cookie",
     log=True,
+    strict=False,
 )
 
 print(df.head())
@@ -70,6 +72,16 @@ df = pywencai.get(
     question="退市股票",
     sort_key="退市@退市日期",
     sort_order="asc",
+)
+```
+
+If you want request/auth/parser failures to raise instead of being converted into an empty `DataFrame`, enable strict mode:
+
+```python
+df = pywencai.get(
+    query="十日涨幅前10",
+    cookie="your iwencai cookie",
+    strict=True,
 )
 ```
 
@@ -91,6 +103,7 @@ The current `get(...)` interface remains compatible with these common parameters
 - `retry`
 - `sleep`
 - `log`
+- `strict`
 - `request_params`
 - `pro`
 - `find`
@@ -102,6 +115,21 @@ The current `get(...)` interface remains compatible with these common parameters
 - Normal users do not need `npm install`. The repository already includes the built `hexin-v.bundle.js`.
 - Node.js is still recommended for best token-generation compatibility at runtime.
 - If Node.js is not available, the package falls back to a Python-generated token. That fallback is convenient, but it may be less reliable than the Node-based path.
+- Tokens are reused only within the same short-lived request bucket: `cookie + resolved User-Agent + explicit proxy identity`. Switching account, User-Agent, or explicit proxy automatically uses a different bucket.
+- Nested follow-up requests inherit the top-level `cookie`, `user_agent`, and explicit `request_params` such as `proxies`, `verify`, and `allow_redirects`.
+
+## Logging
+
+- `log=True` keeps request-path logs enabled.
+- `log=False` keeps the library silent, including auth and parser retry paths.
+- Host applications can route package logs to their own logger with:
+
+```python
+import logging
+import pywencai
+
+pywencai.configure_logger(logging.getLogger("my-app"))
+```
 
 ## Maintainer workflow
 
@@ -125,7 +153,7 @@ npx webpack --config webpack.config.js
 Run the standalone package tests with:
 
 ```bash
-python -m unittest tests.test_pywencai
+PYTHONPATH=src python -m unittest tests.test_pywencai
 ```
 
 ## Attribution
