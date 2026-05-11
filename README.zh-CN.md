@@ -124,6 +124,7 @@ df = pywencai.get(
 
 - `log=True` 时保留请求链路日志。
 - `log=False` 时库内部保持静默，包含鉴权重试和解析重试路径。
+- 如果宿主应用需要更强的全局约束，可以直接关闭当前进程里的运行态日志。关闭后，即使某些调用点仍传了 `log=True`，库也会继续保持静默，直到宿主重新打开。
 - 宿主应用如果想把日志并入自己的 logger，可以这样接：
 
 ```python
@@ -131,6 +132,7 @@ import logging
 import pywencai
 
 pywencai.configure_logger(logging.getLogger("my-app"))
+pywencai.configure_runtime_logging(False)
 ```
 
 ## 维护者工作流

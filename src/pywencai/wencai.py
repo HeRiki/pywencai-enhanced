@@ -36,6 +36,7 @@ LANDING_DATA_URL = f"{IWENCAI_BASE_URL}/gateway/urp/v7/landing/getDataList"
 STOCK_PICK_FIND_URL = f"{IWENCAI_BASE_URL}/unifiedwap/unified-wap/v2/stock-pick/find"
 
 _SESSION = None
+_RUNTIME_LOGGING_ENABLED = True
 
 
 class WencaiResponseError(Exception):
@@ -64,6 +65,19 @@ def clear_runtime_state():
     if _SESSION is not None:
         _SESSION.close()
         _SESSION = None
+
+
+def set_runtime_logging_enabled(enabled):
+    global _RUNTIME_LOGGING_ENABLED
+    _RUNTIME_LOGGING_ENABLED = bool(enabled)
+
+
+def is_runtime_logging_enabled():
+    return _RUNTIME_LOGGING_ENABLED
+
+
+def _resolve_runtime_log_flag(log):
+    return bool(log) and is_runtime_logging_enabled()
 
 
 def reset_runtime_http_state(reason=None):
@@ -1051,7 +1065,8 @@ def _fetch_result_dataframe(params, loop=False, log=False, strict=False, **kwarg
 def get(loop=False, **kwargs):
     """获取结果。"""
     kwargs = _normalize_get_kwargs(kwargs)
-    log = kwargs.get("log", True)
+    log = _resolve_runtime_log_flag(kwargs.get("log", True))
+    kwargs["log"] = log
     strict = kwargs.get("strict", False)
     with _library_log_scope(log):
         try:

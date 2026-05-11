@@ -124,6 +124,7 @@ The current `get(...)` interface remains compatible with these common parameters
 
 - `log=True` keeps request-path logs enabled.
 - `log=False` keeps the library silent, including auth and parser retry paths.
+- Host applications that need a harder global guarantee can disable runtime logs for the current process. After that, even call sites that still pass `log=True` will stay silent until the host re-enables logging.
 - Host applications can route package logs to their own logger with:
 
 ```python
@@ -131,6 +132,7 @@ import logging
 import pywencai
 
 pywencai.configure_logger(logging.getLogger("my-app"))
+pywencai.configure_runtime_logging(False)
 ```
 
 ## Maintainer workflow

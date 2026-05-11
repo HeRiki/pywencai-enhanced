@@ -49,6 +49,8 @@ class TestPyWencaiHelpers(unittest.TestCase):
     def test_package_exports_expected_public_api(self):
         self.assertTrue(callable(pywencai.get))
         self.assertTrue(callable(pywencai.configure_logger))
+        self.assertTrue(callable(pywencai.configure_runtime_logging))
+        self.assertTrue(callable(pywencai.is_runtime_logging_enabled))
         self.assertTrue(callable(pywencai.reset_logger))
 
     def test_tab1_handler_uses_dict_copy_instead_of_invalid_set(self):
@@ -840,6 +842,37 @@ class TestPyWencaiHelpers(unittest.TestCase):
     def test_get_log_true_records_failure(self):
         capture_logger, handler = self._build_capture_logger("pywencai.verbose")
         pywencai.configure_logger(capture_logger)
+        with patch.object(
+            wencai_module,
+            "get_robot_data",
+            side_effect=requests.exceptions.HTTPError("boom"),
+        ):
+            result = wencai_module.get(query="测试", strict=False, log=True)
+
+        self.assertTrue(result.empty)
+        self.assertTrue(any("get函数执行失败" in record.getMessage() for record in handler.records))
+
+    def test_global_runtime_logging_override_silences_log_true(self):
+        capture_logger, handler = self._build_capture_logger("pywencai.global-silent")
+        pywencai.configure_logger(capture_logger)
+        pywencai.configure_runtime_logging(False)
+        with patch.object(
+            wencai_module,
+            "get_robot_data",
+            side_effect=requests.exceptions.HTTPError("boom"),
+        ):
+            result = wencai_module.get(query="测试", strict=False, log=True)
+
+        self.assertTrue(result.empty)
+        self.assertEqual(handler.records, [])
+
+    def test_runtime_logging_override_can_be_reenabled(self):
+        capture_logger, handler = self._build_capture_logger("pywencai.global-toggle")
+        pywencai.configure_logger(capture_logger)
+        pywencai.configure_runtime_logging(False)
+        self.assertFalse(pywencai.is_runtime_logging_enabled())
+        pywencai.configure_runtime_logging(True)
+        self.assertTrue(pywencai.is_runtime_logging_enabled())
         with patch.object(
             wencai_module,
             "get_robot_data",
