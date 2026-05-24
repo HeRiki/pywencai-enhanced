@@ -1,4 +1,6 @@
 import hashlib
+import contextlib
+import contextvars
 import logging
 import os
 import re
@@ -8,10 +10,91 @@ import threading
 import time
 from collections import Counter, deque
 from typing import Any, Dict, Optional, Tuple
-from urllib.parse import quote
+from urllib.parse import quote, unquote, urlsplit, urlunsplit
+
+_RUNTIME_LOGGING_ENABLED = True
+_RUNTIME_LOGGING_STATE_LOCK = threading.RLock()
+_RUNTIME_LOGGING_SCOPE = contextvars.ContextVar("pywencai_runtime_logging_scope", default=True)
+
+
+def set_runtime_logging_enabled(enabled):
+    """Set process-level runtime logging gate without mutating host loggers."""
+    global _RUNTIME_LOGGING_ENABLED
+    with _RUNTIME_LOGGING_STATE_LOCK:
+        _RUNTIME_LOGGING_ENABLED = bool(enabled)
+
+
+def is_runtime_logging_enabled():
+    with _RUNTIME_LOGGING_STATE_LOCK:
+        return bool(_RUNTIME_LOGGING_ENABLED)
+
+
+def is_runtime_logging_allowed():
+    return is_runtime_logging_enabled() and bool(_RUNTIME_LOGGING_SCOPE.get())
+
+
+@contextlib.contextmanager
+def runtime_log_scope(enabled):
+    token = _RUNTIME_LOGGING_SCOPE.set(bool(enabled))
+    try:
+        yield
+    finally:
+        _RUNTIME_LOGGING_SCOPE.reset(token)
+
+
+class RuntimeLoggerProxy(logging.Logger):
+    """Proxy logger calls through pywencai's runtime logging gate."""
+
+    def __init__(self, target_logger):
+        super().__init__(target_logger.name, target_logger.level)
+        self._target_logger = target_logger
+
+    @property
+    def target_logger(self):
+        return self._target_logger
+
+    def __getattr__(self, name):
+        return getattr(self._target_logger, name)
+
+    def setLevel(self, level):
+        super().setLevel(level)
+        self._target_logger.setLevel(level)
+
+    def _call(self, method_name, level, *args, **kwargs):
+        if is_runtime_logging_allowed():
+            if self.handlers:
+                return self._log(level, args[0] if args else "", args[1:], **kwargs)
+            return getattr(self._target_logger, method_name)(*args, **kwargs)
+        return None
+
+    def debug(self, *args, **kwargs):
+        return self._call("debug", logging.DEBUG, *args, **kwargs)
+
+    def info(self, *args, **kwargs):
+        return self._call("info", logging.INFO, *args, **kwargs)
+
+    def warning(self, *args, **kwargs):
+        return self._call("warning", logging.WARNING, *args, **kwargs)
+
+    def error(self, *args, **kwargs):
+        return self._call("error", logging.ERROR, *args, **kwargs)
+
+    def exception(self, *args, **kwargs):
+        kwargs.setdefault("exc_info", True)
+        return self._call("error", logging.ERROR, *args, **kwargs)
+
+    def critical(self, *args, **kwargs):
+        return self._call("critical", logging.CRITICAL, *args, **kwargs)
+
+
+def runtime_logger(target_logger):
+    if isinstance(target_logger, RuntimeLoggerProxy):
+        return target_logger
+    return RuntimeLoggerProxy(target_logger)
+
 
 # 使用模块级日志记录器
-logger = logging.getLogger(__name__)
+logger = runtime_logger(logging.getLogger(__name__))
 logger.setLevel(logging.INFO)
 
 DEFAULT_USER_AGENT = (
@@ -29,6 +112,8 @@ _NODE_AVAILABLE_CACHE: Optional[Tuple[bool, Optional[str]]] = None
 _TOKEN_CACHE: Dict[str, Dict[str, Any]] = {}
 _USER_AGENT_CACHE = {"value": None}
 _RUNTIME_REQUEST_ID_SEQ = 0
+_TOKEN_CACHE_LOCK = threading.RLock()
+_HEADER_STATE_LOCK = threading.RLock()
 _RUNTIME_METRICS_LOCK = threading.Lock()
 _RUNTIME_METRICS = {
     "token_total_calls": 0,
@@ -61,15 +146,17 @@ def write_log(message, level="INFO"):
         elif level == "WARNING":
             logger.warning(message)
     except Exception as exc:  # pragma: no cover - 日志兜底
-        print(f"记录日志失败: {exc}")
+        print(f"记录日志失败: {redact_sensitive_text(exc, limit=240)}")
 
 
 def clear_runtime_cache():
     """清理 Node/UA/token 的进程内缓存，供测试和异常恢复使用。"""
     global _NODE_AVAILABLE_CACHE
-    _NODE_AVAILABLE_CACHE = None
-    _TOKEN_CACHE.clear()
-    _USER_AGENT_CACHE["value"] = None
+    with _HEADER_STATE_LOCK:
+        _NODE_AVAILABLE_CACHE = None
+        _USER_AGENT_CACHE["value"] = None
+    with _TOKEN_CACHE_LOCK:
+        _TOKEN_CACHE.clear()
 
 
 def clear_runtime_metrics():
@@ -120,6 +207,134 @@ def _normalize_metric_label(value, default):
     text = str(value or default).strip()
     normalized = re.sub(r"[^0-9A-Za-z_.:-]+", "_", text)
     return normalized or default
+
+
+_SENSITIVE_AUTH_FIELD_PATTERN = (
+    r"iwc_token|sessionid|sess_tk|ticket|user_id|userid|cookie|hexin-v|token"
+)
+_SENSITIVE_AUTH_OR_USER_FIELD_PATTERN = rf"{_SENSITIVE_AUTH_FIELD_PATTERN}|user"
+_SENSITIVE_QUERY_PATTERN = re.compile(
+    rf"(?i)(urp\.user|{_SENSITIVE_AUTH_FIELD_PATTERN})=([^&\s]+)"
+)
+_SENSITIVE_JSON_PATTERN = re.compile(
+    rf'(?i)("?(?:{_SENSITIVE_AUTH_OR_USER_FIELD_PATTERN})"?\s*[:=]\s*")([^"]*)(")'
+)
+_SENSITIVE_REPR_PATTERN = re.compile(
+    rf"(?i)('?(?:{_SENSITIVE_AUTH_OR_USER_FIELD_PATTERN})'?\s*[:=]\s*')([^']*)(')"
+)
+_SENSITIVE_STRUCTURED_USER_PATTERN = re.compile(
+    r"(?i)(?P<prefix>(?P<quote>['\"])user(?P=quote)\s*[:=]\s*)"
+)
+
+
+def _find_structured_value_end(text, start):
+    length = len(text)
+    pos = start
+    while pos < length and text[pos].isspace():
+        pos += 1
+    if pos >= length:
+        return start
+
+    first = text[pos]
+    if first in ("'", '"'):
+        quote_char = first
+        pos += 1
+        escaped = False
+        while pos < length:
+            char = text[pos]
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote_char:
+                return pos + 1
+            pos += 1
+        return length
+
+    if first in "{[":
+        closing_by_open = {"{": "}", "[": "]"}
+        stack = [first]
+        pos += 1
+        quote_char = None
+        escaped = False
+        while pos < length:
+            char = text[pos]
+            if quote_char:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == quote_char:
+                    quote_char = None
+            elif char in ("'", '"'):
+                quote_char = char
+            elif char in "{[":
+                stack.append(char)
+            elif stack and char == closing_by_open[stack[-1]]:
+                stack.pop()
+                if not stack:
+                    return pos + 1
+            pos += 1
+        return length
+
+    while pos < length and text[pos] not in ",}&]\r\n":
+        pos += 1
+    return pos
+
+
+def _redact_structured_user_fields(text):
+    chunks = []
+    last = 0
+    for match in _SENSITIVE_STRUCTURED_USER_PATTERN.finditer(text):
+        if match.start() < last:
+            continue
+        value_start = match.end()
+        value_end = _find_structured_value_end(text, value_start)
+        if value_end <= value_start:
+            continue
+        quote_char = match.group("quote")
+        replacement = '"<redacted>"' if quote_char == '"' else "'<redacted>'"
+        chunks.append(text[last:match.end()])
+        chunks.append(replacement)
+        last = value_end
+    if not chunks:
+        return text
+    chunks.append(text[last:])
+    return "".join(chunks)
+
+
+def _redact_sensitive_plain_text(text):
+    text = _SENSITIVE_QUERY_PATTERN.sub(r"\1=<redacted>", text)
+    text = _SENSITIVE_JSON_PATTERN.sub(r"\1<redacted>\3", text)
+    text = _SENSITIVE_REPR_PATTERN.sub(r"\1<redacted>\3", text)
+    return _redact_structured_user_fields(text)
+
+
+def redact_sensitive_text(value, limit=None):
+    text = "" if value is None else str(value)
+    text = _redact_sensitive_plain_text(text)
+    try:
+        decoded_text = unquote(text)
+    except Exception:
+        decoded_text = text
+    if decoded_text != text:
+        text = _redact_sensitive_plain_text(decoded_text)
+    if limit is not None and len(text) > limit:
+        return f"{text[:limit]}..."
+    return text
+
+
+def sanitize_url_for_metrics(url):
+    if not url:
+        return ""
+    text = str(url)
+    try:
+        parsed = urlsplit(text)
+    except ValueError:
+        return redact_sensitive_text(text, limit=240)
+    if parsed.query:
+        return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "<redacted>", ""))
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
 
 
 def _runtime_outcome_label(outcome, status_code=None):
@@ -204,7 +419,7 @@ def record_request_event(
         "query": str(query or ""),
         "query_type": str(query_type or ""),
         "page": page,
-        "url": str(url or ""),
+        "url": sanitize_url_for_metrics(url),
     }
     with _RUNTIME_METRICS_LOCK:
         _RUNTIME_METRICS["request_event_total"] += 1
@@ -272,15 +487,16 @@ def find_packed_node():
         logger.debug("未找到打包的Node.js，所有可能路径都不存在")
         return None
     except Exception as exc:  # pragma: no cover - 运行环境相关
-        logger.error(f"查找打包的Node.js时发生异常: {exc}", exc_info=True)
+        logger.error(f"查找打包的Node.js时发生异常: {redact_sensitive_text(exc, limit=240)}")
         return None
 
 
 def check_node_available():
     """检查 Node.js 是否可用。"""
     global _NODE_AVAILABLE_CACHE
-    if _NODE_AVAILABLE_CACHE is not None:
-        return _NODE_AVAILABLE_CACHE
+    with _HEADER_STATE_LOCK:
+        if _NODE_AVAILABLE_CACHE is not None:
+            return _NODE_AVAILABLE_CACHE
     try:
         packed_node_path = find_packed_node()
         if packed_node_path:
@@ -293,8 +509,9 @@ def check_node_available():
             )
             if result.returncode == 0:
                 logger.debug(f"打包的Node.js可用，版本: {result.stdout.strip()}")
-                _NODE_AVAILABLE_CACHE = (True, packed_node_path)
-                return _NODE_AVAILABLE_CACHE
+                with _HEADER_STATE_LOCK:
+                    _NODE_AVAILABLE_CACHE = (True, packed_node_path)
+                    return _NODE_AVAILABLE_CACHE
 
         result = subprocess.run(
             ["node", "--version"],
@@ -305,20 +522,24 @@ def check_node_available():
         )
         if result.returncode == 0:
             logger.debug(f"系统Node.js可用，版本: {result.stdout.strip()}")
-            _NODE_AVAILABLE_CACHE = (True, "node")
-            return _NODE_AVAILABLE_CACHE
+            with _HEADER_STATE_LOCK:
+                _NODE_AVAILABLE_CACHE = (True, "node")
+                return _NODE_AVAILABLE_CACHE
 
-        logger.error(f"系统Node.js不可用: {result.stderr}")
-        _NODE_AVAILABLE_CACHE = (False, None)
-        return _NODE_AVAILABLE_CACHE
+        logger.error(f"系统Node.js不可用: {redact_sensitive_text(result.stderr, limit=240)}")
+        with _HEADER_STATE_LOCK:
+            _NODE_AVAILABLE_CACHE = (False, None)
+            return _NODE_AVAILABLE_CACHE
     except FileNotFoundError:
         logger.error("系统Node.js未安装或未添加到PATH环境变量中")
-        _NODE_AVAILABLE_CACHE = (False, None)
-        return _NODE_AVAILABLE_CACHE
+        with _HEADER_STATE_LOCK:
+            _NODE_AVAILABLE_CACHE = (False, None)
+            return _NODE_AVAILABLE_CACHE
     except Exception as exc:  # pragma: no cover - 运行环境相关
-        logger.error(f"检查Node.js可用性时发生异常: {exc}")
-        _NODE_AVAILABLE_CACHE = (False, None)
-        return _NODE_AVAILABLE_CACHE
+        logger.error(f"检查Node.js可用性时发生异常: {redact_sensitive_text(exc, limit=240)}")
+        with _HEADER_STATE_LOCK:
+            _NODE_AVAILABLE_CACHE = (False, None)
+            return _NODE_AVAILABLE_CACHE
 
 
 def generate_token_python():
@@ -332,11 +553,11 @@ def generate_token_python():
         token_str = f"hexin-v{timestamp}hexin"
         token = hashlib.md5(token_str.encode("utf-8")).hexdigest()
         final_token = f"{token}"
-        logger.debug(f"生成Python token: {final_token}")
+        logger.debug("生成Python token: generation_mode=python")
         logger.warning("注意：Python生成的token可能无效，建议安装Node.js以获取有效token")
         return final_token
     except Exception as exc:  # pragma: no cover - 理论上很难触发
-        logger.error(f"生成Python token失败: {exc}")
+        logger.error(f"生成Python token失败: {redact_sensitive_text(exc, limit=240)}")
         return "default-token"
 
 
@@ -351,17 +572,19 @@ def get_user_agent(user_agent=None):
     """获取进程级稳定 User-Agent。"""
     if user_agent:
         return user_agent
-    if _USER_AGENT_CACHE["value"]:
-        return _USER_AGENT_CACHE["value"]
+    with _HEADER_STATE_LOCK:
+        if _USER_AGENT_CACHE["value"]:
+            return _USER_AGENT_CACHE["value"]
     try:
         from fake_useragent import UserAgent
 
         ua = UserAgent()
         resolved = ua.random
     except Exception as exc:  # pragma: no cover - 第三方环境相关
-        logger.warning(f"生成随机User-Agent失败，回退默认值: {exc}")
+        logger.warning(f"生成随机User-Agent失败，回退默认值: {redact_sensitive_text(exc, limit=240)}")
         resolved = DEFAULT_USER_AGENT
-    _USER_AGENT_CACHE["value"] = resolved
+    with _HEADER_STATE_LOCK:
+        _USER_AGENT_CACHE["value"] = resolved
     return resolved
 
 
@@ -401,47 +624,52 @@ def format_token_bucket_label(bucket_key):
 
 def _purge_expired_token_buckets(now=None):
     now = now if now is not None else time.time()
-    expired_keys = [
-        key
-        for key, entry in list(_TOKEN_CACHE.items())
-        if now >= float(entry.get("expires_at", 0.0))
-    ]
-    for key in expired_keys:
-        _TOKEN_CACHE.pop(key, None)
+    with _TOKEN_CACHE_LOCK:
+        expired_keys = [
+            key
+            for key, entry in list(_TOKEN_CACHE.items())
+            if now >= float(entry.get("expires_at", 0.0))
+        ]
+        for key in expired_keys:
+            _TOKEN_CACHE.pop(key, None)
 
 
 def _prune_token_bucket_cache():
-    if len(_TOKEN_CACHE) <= TOKEN_CACHE_MAX_BUCKETS:
-        return
-    ordered_keys = sorted(
-        _TOKEN_CACHE,
-        key=lambda key: (
-            float(_TOKEN_CACHE[key].get("expires_at", 0.0)),
-            float(_TOKEN_CACHE[key].get("updated_at", 0.0)),
-        ),
-    )
-    while len(_TOKEN_CACHE) > TOKEN_CACHE_MAX_BUCKETS and ordered_keys:
-        _TOKEN_CACHE.pop(ordered_keys.pop(0), None)
+    with _TOKEN_CACHE_LOCK:
+        if len(_TOKEN_CACHE) <= TOKEN_CACHE_MAX_BUCKETS:
+            return
+        ordered_keys = sorted(
+            _TOKEN_CACHE,
+            key=lambda key: (
+                float(_TOKEN_CACHE[key].get("expires_at", 0.0)),
+                float(_TOKEN_CACHE[key].get("updated_at", 0.0)),
+            ),
+        )
+        while len(_TOKEN_CACHE) > TOKEN_CACHE_MAX_BUCKETS and ordered_keys:
+            _TOKEN_CACHE.pop(ordered_keys.pop(0), None)
 
 
 def _set_cached_token(bucket_key, token, expires_at):
-    _TOKEN_CACHE[bucket_key] = {
-        "value": token,
-        "expires_at": float(expires_at),
-        "updated_at": time.time(),
-    }
+    with _TOKEN_CACHE_LOCK:
+        _TOKEN_CACHE[bucket_key] = {
+            "value": token,
+            "expires_at": float(expires_at),
+            "updated_at": time.time(),
+        }
     _prune_token_bucket_cache()
 
 
 def _get_cached_token(bucket_key, now):
-    entry = _TOKEN_CACHE.get(bucket_key)
-    if not entry:
-        return None
-    if now >= float(entry.get("expires_at", 0.0)):
-        _TOKEN_CACHE.pop(bucket_key, None)
-        return None
-    entry["updated_at"] = now
-    return entry.get("value")
+    with _TOKEN_CACHE_LOCK:
+        entry = _TOKEN_CACHE.get(bucket_key)
+        if not entry:
+            return None, None
+        expires_at = float(entry.get("expires_at", 0.0))
+        if now >= expires_at:
+            _TOKEN_CACHE.pop(bucket_key, None)
+            return None, None
+        entry["updated_at"] = now
+        return entry.get("value"), expires_at - now
 
 
 def get_token(
@@ -473,7 +701,7 @@ def get_token(
             refresh_reason=refresh_reason,
         )
     if cache_policy == CACHE_POLICY_REUSE and not force_refresh:
-        cached_token = _get_cached_token(resolved_bucket_key, now)
+        cached_token, ttl_remaining = _get_cached_token(resolved_bucket_key, now)
         if cached_token:
             _record_token_event(
                 bucket_key=resolved_bucket_key,
@@ -482,7 +710,7 @@ def get_token(
             )
             logger.debug(
                 f"命中token缓存: bucket={format_token_bucket_label(resolved_bucket_key)}, "
-                f"ttl_remaining={float(_TOKEN_CACHE[resolved_bucket_key]['expires_at']) - now:.2f}"
+                f"ttl_remaining={float(ttl_remaining or 0):.2f}"
             )
             return cached_token
 
@@ -503,8 +731,8 @@ def get_token(
             if result.returncode == 0:
                 bundle_token = result.stdout.strip()
                 logger.info(
-                    f"成功使用Node.js bundle生成token: {bundle_token[:10]}..., "
-                    f"bucket={format_token_bucket_label(resolved_bucket_key)}"
+                    "成功使用Node.js bundle生成token: "
+                    f"generation_mode=node_bundle, bucket={format_token_bucket_label(resolved_bucket_key)}"
                 )
                 if cache_policy == CACHE_POLICY_REUSE:
                     _set_cached_token(resolved_bucket_key, bundle_token, now + ttl_seconds)
@@ -514,7 +742,7 @@ def get_token(
                 )
                 return bundle_token
 
-            logger.error(f"使用hexin-v.bundle.js生成token失败: {result.stderr}")
+            logger.error(f"使用hexin-v.bundle.js生成token失败: {redact_sensitive_text(result.stderr, limit=240)}")
             logger.info("尝试使用hexin-v.js生成token...")
             result = subprocess.run(
                 [node_path, os.path.join(os.path.dirname(__file__), "hexin-v.js")],
@@ -526,8 +754,8 @@ def get_token(
             if result.returncode == 0:
                 node_token = result.stdout.strip()
                 logger.info(
-                    f"成功使用Node.js脚本生成token: {node_token[:10]}..., "
-                    f"bucket={format_token_bucket_label(resolved_bucket_key)}"
+                    "成功使用Node.js脚本生成token: "
+                    f"generation_mode=node_script, bucket={format_token_bucket_label(resolved_bucket_key)}"
                 )
                 if cache_policy == CACHE_POLICY_REUSE:
                     _set_cached_token(resolved_bucket_key, node_token, now + ttl_seconds)
@@ -537,7 +765,7 @@ def get_token(
                 )
                 return node_token
 
-            logger.error(f"使用hexin-v.js生成token失败: {result.stderr}")
+            logger.error(f"使用hexin-v.js生成token失败: {redact_sensitive_text(result.stderr, limit=240)}")
             logger.warning("Node.js可用但生成token失败，尝试使用Python生成token")
         else:
             logger.warning("Node.js不可用，尝试使用Python生成token")
@@ -545,8 +773,8 @@ def get_token(
         python_token = generate_token_python()
         if python_token and python_token != "default-token":
             logger.info(
-                f"使用Python生成的token: {python_token[:10]}..., "
-                f"bucket={format_token_bucket_label(resolved_bucket_key)}"
+                "使用Python生成token: "
+                f"generation_mode=python, bucket={format_token_bucket_label(resolved_bucket_key)}"
             )
             if cache_policy == CACHE_POLICY_REUSE:
                 _set_cached_token(resolved_bucket_key, python_token, now + ttl_seconds)
@@ -564,11 +792,15 @@ def get_token(
         )
         return "default-token"
     except Exception as exc:  # pragma: no cover - 外部环境相关
-        logger.error(f"获取token时发生异常: {exc}")
+        logger.error(f"获取token时发生异常: {redact_sensitive_text(exc, limit=240)}")
         logger.error("建议安装Node.js以获取有效token，否则可能无法获取数据")
         try:
             fallback_token = generate_token_python()
-            logger.debug(f"使用fallback token: {fallback_token[:10]}...")
+            logger.debug(
+                "使用fallback token: "
+                f"generation_mode=python_fallback_after_exception, "
+                f"bucket={format_token_bucket_label(resolved_bucket_key)}"
+            )
             if cache_policy == CACHE_POLICY_REUSE:
                 _set_cached_token(resolved_bucket_key, fallback_token, now + ttl_seconds)
             _record_token_event(

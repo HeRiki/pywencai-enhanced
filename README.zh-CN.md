@@ -38,7 +38,7 @@ pip install git+https://github.com/HeRiki/pywencai-enhanced.git
 按 tag 安装指定版本：
 
 ```bash
-pip install git+https://github.com/HeRiki/pywencai-enhanced.git@v0.2.0
+pip install git+https://github.com/HeRiki/pywencai-enhanced.git@v0.2.1
 ```
 
 本地开发安装：
@@ -85,6 +85,8 @@ df = pywencai.get(
 )
 ```
 
+维护任务、兜底数据源、探针和其他要求正确性的路径应使用 `strict=True`。只有空结果本身就是合法业务结果时，才保留默认的 `strict=False`。
+
 ## 对外接口
 
 - `from pywencai import get`
@@ -125,6 +127,9 @@ df = pywencai.get(
 - `log=True` 时保留请求链路日志。
 - `log=False` 时库内部保持静默，包含鉴权重试和解析重试路径。
 - 如果宿主应用需要更强的全局约束，可以直接关闭当前进程里的运行态日志。关闭后，即使某些调用点仍传了 `log=True`，库也会继续保持静默，直到宿主重新打开。
+- 运行态日志 gate 不会把宿主传入的 logger 设成 `disabled=True`，因此不会误关业务侧共用 logger。
+- runtime telemetry、响应摘要、异常文本和 response headers 会脱敏 URL query 与鉴权字段，包括 `cookie`、`token`、`iwc_token`、`sessionid`、`sess_tk`、`ticket`、`user_id`、`urp.user` / `user` 用户权限载荷。
+- 脱敏同样覆盖 URL-encoded 的鉴权 payload，因为问财可能把 `sess_tk` / `ticket` / `urp.user` 用户权限载荷包在编码后的 JSON query value 里。
 - 宿主应用如果想把日志并入自己的 logger，可以这样接：
 
 ```python
@@ -191,6 +196,7 @@ python scripts/stress_test.py \
 - `get-robot-data` 的首包和鉴权重试都绕过 token cache
 - 这不是泛化的“尽量少复用”，而是针对高频下已观测到的 `robot.initial.401/403 -> refresh success` 模式做的定点规避
 - `page` 和 `nested` 请求暂时仍保留正常的 cache reuse 策略
+- `get_page()` 只会把查询、排序、分页等白名单字段发到请求体；`cookie`、`user_agent`、`request_params`、`log`、`strict` 等内部控制参数不会作为表单字段提交
 
 不要把真实 cookie 或压测结果文件提交进仓库。
 

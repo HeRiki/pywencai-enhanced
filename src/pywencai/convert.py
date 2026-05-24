@@ -12,10 +12,13 @@ from .headers import (
     allocate_request_id,
     build_request_headers,
     format_token_bucket_label,
+    redact_sensitive_text,
     record_request_event,
+    runtime_logger,
+    sanitize_url_for_metrics,
 )
 
-logger = logging.getLogger(__name__)
+logger = runtime_logger(logging.getLogger(__name__))
 logger.setLevel(logging.INFO)
 
 UNKNOWN_SHOW_TYPE_COUNTS = {}
@@ -52,7 +55,11 @@ class ConvertMissingComponentsError(ConvertError):
 
 
 def _response_snippet(text, limit=500):
-    return (text or "").strip()[:limit]
+    return redact_sensitive_text((text or "").strip(), limit=limit)
+
+
+def _exception_snippet(exc, limit=240):
+    return redact_sensitive_text(str(exc), limit=limit)
 
 
 def _summarize_content_for_logging(content):
@@ -202,7 +209,7 @@ def _parse_nested_json_response(response_text):
         result = json.loads(response_text)
     except json.JSONDecodeError as exc:
         raise ConvertInvalidJsonError(
-            f"嵌套请求JSON解析失败: {exc}; snippet={_response_snippet(response_text)}"
+            f"嵌套请求JSON解析失败: {_exception_snippet(exc)}; snippet={_response_snippet(response_text)}"
         ) from exc
     if not isinstance(result, dict):
         raise ConvertMissingDataError(f"嵌套请求顶层不是字典类型: type={type(result).__name__}")
@@ -213,7 +220,8 @@ def get_url(url, request_context=None, depth=0, max_depth=DEFAULT_NESTED_MAX_DEP
     request_context = _normalize_request_context(request_context)
     if depth >= max_depth:
         request_context.get("log", True) and logger.warning(
-            f"获取嵌套问财数据已达到最大深度: url={url}, depth={depth}, max_depth={max_depth}"
+            f"获取嵌套问财数据已达到最大深度: url={sanitize_url_for_metrics(url)}, "
+            f"depth={depth}, max_depth={max_depth}"
         )
         return None
 
@@ -244,7 +252,7 @@ def get_url(url, request_context=None, depth=0, max_depth=DEFAULT_NESTED_MAX_DEP
         )
         if log:
             logger.debug(
-                f"嵌套请求开始: url={full_url}, "
+                f"嵌套请求开始: url={sanitize_url_for_metrics(full_url)}, "
                 f"bucket={format_token_bucket_label(bucket_key)}, "
                 f"refresh_reason={refresh_reason or '-'}"
             )
@@ -309,7 +317,9 @@ def get_url(url, request_context=None, depth=0, max_depth=DEFAULT_NESTED_MAX_DEP
         return send(force_refresh_token=False, attempt_stage="initial")
     except rq.exceptions.HTTPError as exc:
         if not _is_auth_http_error(exc):
-            log and logger.warning(f"获取嵌套问财数据失败: url={url}, error={exc}")
+            log and logger.warning(
+                f"获取嵌套问财数据失败: url={sanitize_url_for_metrics(url)}, error={_exception_snippet(exc)}"
+            )
             return None
         try:
             return send(
@@ -318,7 +328,9 @@ def get_url(url, request_context=None, depth=0, max_depth=DEFAULT_NESTED_MAX_DEP
                 attempt_stage="refresh",
             )
         except Exception as retry_exc:  # pragma: no cover - 次级失败路径
-            log and logger.warning(f"获取嵌套问财数据失败: url={url}, error={retry_exc}")
+            log and logger.warning(
+                f"获取嵌套问财数据失败: url={sanitize_url_for_metrics(url)}, error={_exception_snippet(retry_exc)}"
+            )
             return None
     except (ConvertError, rq.exceptions.RequestException) as exc:
         try:
@@ -328,10 +340,14 @@ def get_url(url, request_context=None, depth=0, max_depth=DEFAULT_NESTED_MAX_DEP
                 attempt_stage="refresh",
             )
         except Exception:
-            log and logger.warning(f"获取嵌套问财数据失败: url={url}, error={exc}")
+            log and logger.warning(
+                f"获取嵌套问财数据失败: url={sanitize_url_for_metrics(url)}, error={_exception_snippet(exc)}"
+            )
             return None
     except Exception as exc:  # pragma: no cover - 兜底
-        log and logger.warning(f"获取嵌套问财数据失败: url={url}, error={exc}")
+        log and logger.warning(
+            f"获取嵌套问财数据失败: url={sanitize_url_for_metrics(url)}, error={_exception_snippet(exc)}"
+        )
         return None
 
 
@@ -466,7 +482,7 @@ def nestedblocks_handler(comp, comps):
             result.append(show_type_handler(sub_comp, comps))
         else:
             request_context.get("log", True) and logger.warning(
-                f"nestedblocks 子块解析失败，已跳过: url={url}, depth={depth}, max_depth={max_depth}"
+                f"nestedblocks 子块解析失败，已跳过: url={sanitize_url_for_metrics(url)}, depth={depth}, max_depth={max_depth}"
             )
     return result
 
@@ -638,7 +654,9 @@ def _parse_robot_response(res):
         result = json.loads(res.text)
         logger.debug(f"原始响应摘要: {_response_snippet(res.text, 240)}...")
     except json.JSONDecodeError as exc:
-        raise ConvertInvalidJsonError(f"JSON解析失败: {exc}; snippet={_response_snippet(res.text)}") from exc
+        raise ConvertInvalidJsonError(
+            f"JSON解析失败: {_exception_snippet(exc)}; snippet={_response_snippet(res.text)}"
+        ) from exc
 
     root_payload = _extract_root_payload(result)
     content = _.get(root_payload, "answer.0.txt.0.content")
@@ -651,7 +669,7 @@ def _parse_robot_response(res):
             content = json.loads(content)
         except json.JSONDecodeError as exc:
             raise ConvertInvalidContentError(
-                f"content字符串JSON解析失败: {exc}; snippet={_response_snippet(content)}"
+                f"content字符串JSON解析失败: {_exception_snippet(exc)}; snippet={_response_snippet(content)}"
             ) from exc
     else:
         logger.debug(f"解析出的content摘要: {_summarize_content_for_logging(content)}")
@@ -715,19 +733,21 @@ def convert(res, raise_on_error=False, request_context=None):
         logger.debug(f"convert函数结果摘要: {_summarize_params_for_logging(params)}")
         return params
     except rq.exceptions.HTTPError as exc:
-        wrapped = ConvertHttpError(f"HTTP错误: 状态码={getattr(res, 'status_code', 'unknown')}, 响应={exc}")
-        logger.error(f"{wrapped}", exc_info=True)
+        wrapped = ConvertHttpError(
+            f"HTTP错误: 状态码={getattr(res, 'status_code', 'unknown')}, 响应={_exception_snippet(exc)}"
+        )
+        logger.error(f"{wrapped}")
         logger.error(f"响应内容前500字符: {_response_snippet(getattr(res, 'text', ''))}")
         if raise_on_error:
             raise wrapped from exc
         return {}
-    except ConvertError:
-        logger.error("convert函数分类异常", exc_info=True)
+    except ConvertError as exc:
+        logger.error(f"convert函数分类异常: {type(exc).__name__} - {_exception_snippet(exc)}")
         if raise_on_error:
             raise
         return {}
     except Exception as exc:  # pragma: no cover - 兜底
-        logger.error(f"convert函数处理异常: {type(exc).__name__} - {exc}", exc_info=True)
+        logger.error(f"convert函数处理异常: {type(exc).__name__} - {_exception_snippet(exc)}")
         logger.error(
             f"异常响应内容前500字符: "
             f"{_response_snippet(getattr(res, 'text', '')) if getattr(res, 'text', None) else '无响应内容'}"

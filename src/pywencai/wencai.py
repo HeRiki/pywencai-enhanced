@@ -2,6 +2,7 @@ import json
 import logging
 import math
 import random
+import threading
 import time
 from contextlib import contextmanager, nullcontext
 from typing import Any, Dict, List
@@ -19,11 +20,16 @@ from .headers import (
     CACHE_POLICY_BYPASS,
     CACHE_POLICY_REUSE,
     format_token_bucket_label,
+    is_runtime_logging_enabled as _headers_runtime_logging_enabled,
     record_request_event,
     record_session_reset,
+    redact_sensitive_text,
+    runtime_log_scope,
+    runtime_logger,
+    set_runtime_logging_enabled as _set_headers_runtime_logging_enabled,
 )
 
-logger = logging.getLogger(__name__)
+logger = runtime_logger(logging.getLogger(__name__))
 logger.setLevel(logging.INFO)
 
 REQUEST_CONFIG = {
@@ -36,7 +42,7 @@ LANDING_DATA_URL = f"{IWENCAI_BASE_URL}/gateway/urp/v7/landing/getDataList"
 STOCK_PICK_FIND_URL = f"{IWENCAI_BASE_URL}/unifiedwap/unified-wap/v2/stock-pick/find"
 
 _SESSION = None
-_RUNTIME_LOGGING_ENABLED = True
+_SESSION_LOCK = threading.RLock()
 
 
 class WencaiResponseError(Exception):
@@ -53,27 +59,28 @@ class WencaiEmptyDataError(WencaiResponseError):
 
 def get_session():
     global _SESSION
-    if _SESSION is None:
-        _SESSION = rq.Session()
-        _SESSION.trust_env = False
-        _SESSION.headers.update({"Connection": "keep-alive"})
-    return _SESSION
+    with _SESSION_LOCK:
+        if _SESSION is None:
+            _SESSION = rq.Session()
+            _SESSION.trust_env = False
+            _SESSION.headers.update({"Connection": "keep-alive"})
+        return _SESSION
 
 
 def clear_runtime_state():
     global _SESSION
-    if _SESSION is not None:
-        _SESSION.close()
-        _SESSION = None
+    with _SESSION_LOCK:
+        if _SESSION is not None:
+            _SESSION.close()
+            _SESSION = None
 
 
 def set_runtime_logging_enabled(enabled):
-    global _RUNTIME_LOGGING_ENABLED
-    _RUNTIME_LOGGING_ENABLED = bool(enabled)
+    _set_headers_runtime_logging_enabled(enabled)
 
 
 def is_runtime_logging_enabled():
-    return _RUNTIME_LOGGING_ENABLED
+    return _headers_runtime_logging_enabled()
 
 
 def _resolve_runtime_log_flag(log):
@@ -88,13 +95,18 @@ def reset_runtime_http_state(reason=None):
 
 def _sanitize_headers_for_logging(raw_headers):
     sanitized = dict(raw_headers or {})
-    for key in ("cookie", "Cookie"):
-        if key in sanitized and sanitized[key]:
+    sensitive_names = {"cookie", "set-cookie", "authorization", "hexin-v", "token", "iwc_token"}
+    for key, value in list(sanitized.items()):
+        normalized_key = str(key).lower()
+        if any(name in normalized_key for name in sensitive_names):
             sanitized[key] = "<redacted>"
-    for key in ("hexin-v", "Hexin-V"):
-        if key in sanitized and sanitized[key]:
-            sanitized[key] = "<redacted>"
+        elif isinstance(value, str):
+            sanitized[key] = redact_sensitive_text(value, limit=240)
     return sanitized
+
+
+def _sanitize_response_headers_for_logging(raw_headers):
+    return _sanitize_headers_for_logging(raw_headers)
 
 
 def _summarize_request_params_for_logging(request_params):
@@ -104,10 +116,14 @@ def _summarize_request_params_for_logging(request_params):
 
 
 def _summarize_response_for_logging(text, limit=240):
-    compact = " ".join(str(text or "").split())
+    compact = redact_sensitive_text(" ".join(str(text or "").split()))
     if len(compact) <= limit:
         return compact
     return f"{compact[:limit]}..."
+
+
+def _exception_snippet(exc, limit=240):
+    return redact_sensitive_text(str(exc), limit=limit)
 
 
 def _summarize_url_params_for_logging(url_params):
@@ -179,19 +195,79 @@ def _log_with_context(level, message, **context):
 
 @contextmanager
 def _library_log_scope(log):
-    if log:
+    with runtime_log_scope(log):
         yield
-        return
 
-    managed_loggers = [logger, convert_module.logger, headers_module.logger]
-    previous_states = [target.disabled for target in managed_loggers]
-    try:
-        for target in managed_loggers:
-            target.disabled = True
-        yield
-    finally:
-        for target, disabled in zip(managed_loggers, previous_states):
-            target.disabled = disabled
+
+_PAGE_CONTROL_KEYS = {
+    "cookie",
+    "user_agent",
+    "request_params",
+    "retry",
+    "sleep",
+    "log",
+    "strict",
+    "pro",
+    "find",
+    "loop",
+    "no_detail",
+}
+_PAGE_FORM_OVERRIDE_KEYS = {
+    "addheaderindexes",
+    "addcolumnslimit",
+    "business_cat",
+    "codelist",
+    "comp_id",
+    "condition",
+    "indexnamelimit",
+    "iwc_token",
+    "logid",
+    "page",
+    "parse_res",
+    "perpage",
+    "query",
+    "query_type",
+    "question",
+    "ret",
+    "sessionid",
+    "source",
+    "urp_sort_index",
+    "urp_sort_way",
+    "urp_use_sort",
+    "user_id",
+    "userid",
+    "uuid",
+}
+
+
+def _is_allowed_page_form_key(key):
+    if key in _PAGE_CONTROL_KEYS:
+        return False
+    if key in _PAGE_FORM_OVERRIDE_KEYS:
+        return True
+    text = str(key)
+    return text.startswith("date_range[") or text.startswith("uuids[")
+
+
+def _build_page_form_data(url_params, kwargs, *, find=None, query_type="stock"):
+    data = {
+        key: value
+        for key, value in (url_params or {}).items()
+        if _is_allowed_page_form_key(key)
+    }
+    data.update(
+        {
+            key: value
+            for key, value in (kwargs or {}).items()
+            if _is_allowed_page_form_key(key)
+        }
+    )
+    data["perpage"] = data.get("perpage", 100)
+    data["page"] = data.get("page", 1)
+    if find is not None:
+        data["query_type"] = query_type
+        data["question"] = find
+    return data
 
 
 def _build_request_context(
@@ -319,15 +395,16 @@ def _request_response(
     refresh_reason=None,
 ):
     try:
-        response = (session or get_session()).request(
-            method=method,
-            url=url,
-            json=json_body,
-            data=form_data,
-            headers=headers_dict,
-            timeout=timeout,
-            **(request_params or {}),
-        )
+        with _SESSION_LOCK:
+            response = (session or get_session()).request(
+                method=method,
+                url=url,
+                json=json_body,
+                data=form_data,
+                headers=headers_dict,
+                timeout=timeout,
+                **(request_params or {}),
+            )
     except rq.exceptions.RequestException as exc:
         if isinstance(exc, rq.exceptions.HTTPError):
             _record_request_outcome(
@@ -376,7 +453,7 @@ def _request_response(
                 "response_bytes": len(response.text),
             },
         )
-        logger.debug(f"响应头: {dict(response.headers)}")
+        logger.debug(f"响应头(脱敏): {_sanitize_response_headers_for_logging(response.headers)}")
         logger.debug(f"响应内容摘要: {_summarize_response_for_logging(response.text)}")
     return response
 
@@ -438,8 +515,6 @@ def while_do(do, retry=10, sleep=0, log=False, raise_last_exception=False):
         log: 是否记录日志
         raise_last_exception: 失败时是否抛出最后一次异常
     """
-    import traceback
-
     attempt = 0
     last_exception = None
     while attempt < retry:
@@ -449,7 +524,7 @@ def while_do(do, retry=10, sleep=0, log=False, raise_last_exception=False):
             last_exception = exc
             log and _log_with_context(
                 "error",
-                f"{attempt + 1}次尝试失败: 请求超时 - {exc}",
+                f"{attempt + 1}次尝试失败: 请求超时 - {_exception_snippet(exc)}",
                 retry_count=retry,
                 attempt=attempt + 1,
             )
@@ -457,7 +532,7 @@ def while_do(do, retry=10, sleep=0, log=False, raise_last_exception=False):
             last_exception = exc
             log and _log_with_context(
                 "error",
-                f"{attempt + 1}次尝试失败: 连接错误 - {exc}",
+                f"{attempt + 1}次尝试失败: 连接错误 - {_exception_snippet(exc)}",
                 retry_count=retry,
                 attempt=attempt + 1,
             )
@@ -467,7 +542,7 @@ def while_do(do, retry=10, sleep=0, log=False, raise_last_exception=False):
             status_code = getattr(getattr(exc, "response", None), "status_code", None)
             log and _log_with_context(
                 "error",
-                f"{attempt + 1}次尝试失败: HTTP错误(status={status_code}) - {exc}",
+                f"{attempt + 1}次尝试失败: HTTP错误(status={status_code}) - {_exception_snippet(exc)}",
                 retry_count=retry,
                 attempt=attempt + 1,
                 status_code=status_code,
@@ -476,12 +551,11 @@ def while_do(do, retry=10, sleep=0, log=False, raise_last_exception=False):
             last_exception = exc
             log and _log_with_context(
                 "error",
-                f"{attempt + 1}次尝试失败: {type(exc).__name__} - {exc}",
+                f"{attempt + 1}次尝试失败: {type(exc).__name__} - {_exception_snippet(exc)}",
                 retry_count=retry,
                 attempt=attempt + 1,
                 error_type=type(exc).__name__,
             )
-            log and logger.debug(f"异常堆栈: {traceback.format_exc()}")
 
         attempt += 1
         if last_exception is None or not _should_retry_exception(last_exception):
@@ -763,7 +837,7 @@ def get_page(url_params, **kwargs):
     pro = kwargs.get("pro", False)
 
     if find is None:
-        data = {**url_params, "perpage": 100, "page": 1, **kwargs}
+        data = _build_page_form_data(url_params, kwargs)
         target_url = LANDING_DATA_URL
         if pro:
             target_url = f"{target_url}?iwcpro=1"
@@ -771,14 +845,7 @@ def get_page(url_params, **kwargs):
     else:
         if isinstance(find, List):
             find = ",".join(find)
-        data = {
-            **url_params,
-            "perpage": 100,
-            "page": 1,
-            "query_type": query_type,
-            "question": find,
-            **kwargs,
-        }
+        data = _build_page_form_data(url_params, kwargs, find=find, query_type=query_type)
         target_url = STOCK_PICK_FIND_URL
         path = "data.data.datas"
 
@@ -787,7 +854,7 @@ def get_page(url_params, **kwargs):
             "info",
             "分页请求开始",
             page=data.get("page"),
-            query=data.get("question") or kwargs.get("query") or kwargs.get("question"),
+            query=data.get("question") or data.get("query") or kwargs.get("query") or kwargs.get("question"),
             query_type=query_type,
             target=target_url,
             find=find,
@@ -796,7 +863,7 @@ def get_page(url_params, **kwargs):
 
         def do():
             page_no = data.get("page", 1)
-            question = data.get("question") or kwargs.get("query") or kwargs.get("question")
+            question = data.get("question") or data.get("query") or kwargs.get("query") or kwargs.get("question")
             request_context = _build_request_context(
                 question=question,
                 query_type=query_type,
@@ -957,7 +1024,7 @@ def get_page(url_params, **kwargs):
                 "error",
                 "分页请求失败",
                 page=data.get("page"),
-                query=data.get("question") or kwargs.get("query") or kwargs.get("question"),
+                query=data.get("question") or data.get("query") or kwargs.get("query") or kwargs.get("question"),
                 query_type=query_type,
                 target=target_url,
             )
@@ -1091,5 +1158,5 @@ def get(loop=False, **kwargs):
         except Exception as exc:
             if strict:
                 raise
-            log and logger.error(f"get函数执行失败: {exc}", exc_info=True)
+            log and logger.error(f"get函数执行失败: {_exception_snippet(exc)}")
             return pd.DataFrame()

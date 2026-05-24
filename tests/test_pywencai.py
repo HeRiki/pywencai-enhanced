@@ -2,8 +2,11 @@
 # -*- coding: utf-8 -*-
 
 from pathlib import Path
+import concurrent.futures
 import logging
 import sys
+import threading
+import time
 import types
 import unittest
 from unittest.mock import Mock, patch
@@ -197,12 +200,84 @@ class TestPyWencaiHelpers(unittest.TestCase):
 
     def test_sanitize_headers_for_logging_redacts_sensitive_values(self):
         sanitized = wencai_module._sanitize_headers_for_logging(
-            {"cookie": "a=b", "hexin-v": "token", "User-Agent": "ua"}
+            {
+                "cookie": "a=b",
+                "hexin-v": "token",
+                "Set-Cookie": "sessionid=secret",
+                "X-Token": "secret-token",
+                "User-Agent": "ua",
+            }
         )
 
         self.assertEqual(sanitized["cookie"], "<redacted>")
         self.assertEqual(sanitized["hexin-v"], "<redacted>")
+        self.assertEqual(sanitized["Set-Cookie"], "<redacted>")
+        self.assertEqual(sanitized["X-Token"], "<redacted>")
         self.assertEqual(sanitized["User-Agent"], "ua")
+
+    def test_redact_sensitive_text_handles_url_encoded_auth_payload(self):
+        text = (
+            "request_params=urp=%7B%22sess_tk%22%3A%22jwt.secret.value%22%2C"
+            "%22ticket%22%3A%22ticket-secret%22%2C%22user_id%22%3A%22user-secret%22%7D"
+            "&iwc_token=plain-secret"
+        )
+
+        redacted = headers_module.redact_sensitive_text(text)
+
+        self.assertNotIn("jwt.secret.value", redacted)
+        self.assertNotIn("ticket-secret", redacted)
+        self.assertNotIn("user-secret", redacted)
+        self.assertNotIn("plain-secret", redacted)
+        self.assertIn("<redacted>", redacted)
+
+    def test_redact_sensitive_text_handles_url_encoded_urp_user_payload(self):
+        text = (
+            "request_params=urp.user%3D%7B%22name%22%3A%22urp-name-secret%22%2C"
+            "%22permission%22%3A%5B%22vip-secret%22%5D%7D&User-Agent=ua-ok"
+        )
+
+        redacted = headers_module.redact_sensitive_text(text)
+
+        self.assertNotIn("urp-name-secret", redacted)
+        self.assertNotIn("vip-secret", redacted)
+        self.assertIn("User-Agent=ua-ok", redacted)
+        self.assertIn("<redacted>", redacted)
+
+    def test_redact_sensitive_text_handles_json_user_payload(self):
+        text = (
+            '{"user":{"name":"json-name-secret","permission":["json-permission-secret"]},'
+            '"User-Agent":"ua-ok"}'
+        )
+
+        redacted = headers_module.redact_sensitive_text(text)
+
+        self.assertNotIn("json-name-secret", redacted)
+        self.assertNotIn("json-permission-secret", redacted)
+        self.assertIn('"User-Agent":"ua-ok"', redacted)
+        self.assertIn("<redacted>", redacted)
+
+    def test_redact_sensitive_text_handles_single_quoted_repr_payload(self):
+        text = "{'sess_tk': 'jwt.secret.value', 'ticket': 'ticket-secret', 'user_id': 'user-secret'}"
+
+        redacted = headers_module.redact_sensitive_text(text)
+
+        self.assertNotIn("jwt.secret.value", redacted)
+        self.assertNotIn("ticket-secret", redacted)
+        self.assertNotIn("user-secret", redacted)
+        self.assertIn("<redacted>", redacted)
+
+    def test_redact_sensitive_text_handles_repr_user_payload(self):
+        text = (
+            "{'user': {'name': 'repr-name-secret', 'permission': ['repr-permission-secret']}, "
+            "'User-Agent': 'ua-ok'}"
+        )
+
+        redacted = headers_module.redact_sensitive_text(text)
+
+        self.assertNotIn("repr-name-secret", redacted)
+        self.assertNotIn("repr-permission-secret", redacted)
+        self.assertIn("'User-Agent': 'ua-ok'", redacted)
+        self.assertIn("<redacted>", redacted)
 
     def test_format_log_context_skips_empty_values(self):
         context = wencai_module._format_log_context(
@@ -430,6 +505,44 @@ class TestPyWencaiHelpers(unittest.TestCase):
         self.assertEqual(metrics["request_bucket_outcomes"][bucket_key], 1)
         self.assertEqual(metrics["recent_request_events"][-1]["request_id"], "robot-000001")
 
+    def test_runtime_metrics_redacts_sensitive_url_values(self):
+        headers_module.record_request_event(
+            request_id="nested-000001",
+            target="nested",
+            attempt_stage="initial",
+            outcome="success",
+            status_code=200,
+            bucket_label="bucket-a",
+            url=(
+                "https://www.iwencai.com/gateway/urp/v7/landing/getDataList?"
+                "iwc_token=secret-token&sessionid=secret-session&user_id=secret-user"
+            ),
+        )
+
+        event_url = headers_module.get_runtime_metrics()["recent_request_events"][-1]["url"]
+
+        self.assertIn("<redacted>", event_url)
+        self.assertNotIn("secret-token", event_url)
+        self.assertNotIn("secret-session", event_url)
+        self.assertNotIn("secret-user", event_url)
+
+    def test_token_generation_logs_do_not_include_token_prefix(self):
+        capture_logger, handler = self._build_capture_logger("pywencai.token-redaction")
+        pywencai.configure_logger(capture_logger)
+
+        with patch.object(headers_module, "check_node_available", return_value=(False, None)):
+            with patch.object(headers_module, "generate_token_python", return_value="secret-token-value"):
+                headers_module.build_auth_headers(
+                    cookie="a=b",
+                    user_agent="ua-a",
+                    cache_policy=headers_module.CACHE_POLICY_BYPASS,
+                )
+
+        messages = "\n".join(record.getMessage() for record in handler.records)
+        self.assertNotIn("secret-token-value", messages)
+        self.assertNotIn("secret-token", messages)
+        self.assertIn("bucket=", messages)
+
     def test_get_session_reuses_singleton(self):
         fake_session = Mock()
         with patch.object(wencai_module.rq, "Session", return_value=fake_session) as mock_session:
@@ -440,6 +553,69 @@ class TestPyWencaiHelpers(unittest.TestCase):
         self.assertIs(second, fake_session)
         self.assertEqual(mock_session.call_count, 1)
         self.assertFalse(fake_session.trust_env)
+
+    def test_runtime_state_helpers_tolerate_concurrent_access(self):
+        with patch.object(headers_module, "check_node_available", return_value=(False, None)):
+            with patch.object(headers_module, "generate_token_python", return_value="token-a"):
+                def build_once(index):
+                    if index % 3 == 0:
+                        headers_module.clear_runtime_cache()
+                    headers_module.build_auth_headers(cookie="a=b", user_agent="ua")
+                    session = wencai_module.get_session()
+                    if index % 4 == 0:
+                        wencai_module.clear_runtime_state()
+                    return session is not None
+
+                with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+                    results = list(executor.map(build_once, range(16)))
+
+        self.assertTrue(all(results))
+
+    def test_clear_runtime_state_waits_for_inflight_session_request(self):
+        entered = threading.Event()
+        release = threading.Event()
+        close_events = []
+        response = Mock()
+        response.text = "{}"
+        response.status_code = 200
+        response.headers = {}
+        response.raise_for_status = Mock()
+
+        class BlockingSession:
+            def __init__(self):
+                self.headers = {}
+                self.trust_env = True
+
+            def request(self, **_kwargs):
+                entered.set()
+                release.wait(timeout=2)
+                return response
+
+            def close(self):
+                close_events.append(time.monotonic())
+
+        fake_session = BlockingSession()
+        with wencai_module._SESSION_LOCK:
+            wencai_module._SESSION = fake_session
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            request_future = executor.submit(
+                wencai_module._request_response,
+                method="GET",
+                url="https://www.iwencai.com/test",
+                headers_dict={},
+                timeout=1,
+                log=False,
+            )
+            self.assertTrue(entered.wait(timeout=1))
+            clear_future = executor.submit(wencai_module.clear_runtime_state)
+            time.sleep(0.05)
+            self.assertFalse(clear_future.done())
+            release.set()
+            self.assertIs(request_future.result(timeout=2), response)
+            clear_future.result(timeout=2)
+
+        self.assertEqual(len(close_events), 1)
 
     def test_get_page_rejects_non_list_data_list(self):
         response = Mock()
@@ -710,6 +886,122 @@ class TestPyWencaiHelpers(unittest.TestCase):
         self.assertEqual(session.request.call_args.kwargs["url"], wencai_module.LANDING_DATA_URL)
         self.assertTrue(session.request.call_args.kwargs["url"].startswith("https://"))
 
+    def test_get_page_does_not_send_internal_control_fields(self):
+        response = Mock()
+        response.text = '{"answer":{"components":[{"data":{"datas":[{"股票代码":"600001"}]}}]}}'
+        response.raise_for_status = Mock()
+        session = Mock()
+        session.request.return_value = response
+
+        with patch.object(wencai_module, "get_session", return_value=session):
+            result = wencai_module.get_page(
+                {
+                    "query": "测试",
+                    "condition": "cond-a",
+                    "cookie": "url-cookie",
+                    "request_params": {"verify": False},
+                    "strict": True,
+                },
+                query="测试",
+                cookie="a=b",
+                user_agent="ua-a",
+                request_params={"proxies": {"https": "http://127.0.0.1:7890"}},
+                no_detail=True,
+                retry=1,
+                log=False,
+                page=3,
+            )
+
+        self.assertIsInstance(result, pd.DataFrame)
+        form_data = session.request.call_args.kwargs["data"]
+        self.assertEqual(form_data["query"], "测试")
+        self.assertEqual(form_data["condition"], "cond-a")
+        self.assertEqual(form_data["page"], 3)
+        self.assertNotIn("cookie", form_data)
+        self.assertNotIn("user_agent", form_data)
+        self.assertNotIn("request_params", form_data)
+        self.assertNotIn("no_detail", form_data)
+        self.assertNotIn("strict", form_data)
+
+    def test_convert_exception_snippet_redacts_sensitive_url_values(self):
+        error = requests.exceptions.HTTPError(
+            "403 Client Error for url: "
+            "https://www.iwencai.com/gateway?iwc_token=secret-token&"
+            "urp=%7B%22sess_tk%22%3A%22jwt.secret.value%22%7D"
+        )
+
+        snippet = convert_module._exception_snippet(error)
+
+        self.assertNotIn("secret-token", snippet)
+        self.assertNotIn("jwt.secret.value", snippet)
+        self.assertIn("<redacted>", snippet)
+
+    def test_while_do_exception_logs_redact_sensitive_values(self):
+        capture_logger, handler = self._build_capture_logger("pywencai.while-do-redaction")
+        pywencai.configure_logger(capture_logger)
+        error = requests.exceptions.HTTPError(
+            "403 Client Error for url: "
+            "https://www.iwencai.com/gateway?iwc_token=secret-token&"
+            "urp=%7B%22ticket%22%3A%22ticket-secret%22%7D"
+        )
+        response = Mock()
+        response.status_code = 403
+        error.response = response
+
+        result = wencai_module.while_do(
+            lambda: (_ for _ in ()).throw(error),
+            retry=1,
+            sleep=0,
+            log=True,
+        )
+
+        messages = "\n".join(record.getMessage() for record in handler.records)
+        self.assertIsNone(result)
+        self.assertNotIn("secret-token", messages)
+        self.assertNotIn("ticket-secret", messages)
+        self.assertNotIn("Traceback", messages)
+        self.assertIn("<redacted>", messages)
+
+    def test_get_failure_log_redacts_sensitive_exception_values(self):
+        capture_logger, handler = self._build_capture_logger("pywencai.get-redaction")
+        pywencai.configure_logger(capture_logger)
+        error = requests.exceptions.HTTPError(
+            "403 Client Error for url: "
+            "https://www.iwencai.com/gateway?iwc_token=secret-token&"
+            "urp=%7B%22sess_tk%22%3A%22jwt.secret.value%22%7D"
+        )
+        with patch.object(wencai_module, "get_robot_data", side_effect=error):
+            result = wencai_module.get(query="测试", strict=False, log=True)
+
+        messages = "\n".join(record.getMessage() for record in handler.records)
+        self.assertTrue(result.empty)
+        self.assertNotIn("secret-token", messages)
+        self.assertNotIn("jwt.secret.value", messages)
+        self.assertNotIn("Traceback", messages)
+        self.assertIn("<redacted>", messages)
+
+    def test_convert_http_error_log_redacts_sensitive_exception_values(self):
+        capture_logger, handler = self._build_capture_logger("pywencai.convert-redaction")
+        pywencai.configure_logger(capture_logger)
+        response = Mock()
+        response.status_code = 403
+        response.text = ""
+        error = requests.exceptions.HTTPError(
+            "403 Client Error for url: "
+            "https://www.iwencai.com/gateway?iwc_token=secret-token&"
+            "urp=%7B%22ticket%22%3A%22ticket-secret%22%7D"
+        )
+        response.raise_for_status.side_effect = error
+
+        result = convert_module.convert(response, raise_on_error=False)
+
+        messages = "\n".join(record.getMessage() for record in handler.records)
+        self.assertEqual(result, {})
+        self.assertNotIn("secret-token", messages)
+        self.assertNotIn("ticket-secret", messages)
+        self.assertNotIn("Traceback", messages)
+        self.assertIn("<redacted>", messages)
+
     def test_while_do_retries_on_429_http_error(self):
         response = Mock()
         response.status_code = 429
@@ -856,6 +1148,7 @@ class TestPyWencaiHelpers(unittest.TestCase):
         capture_logger, handler = self._build_capture_logger("pywencai.global-silent")
         pywencai.configure_logger(capture_logger)
         pywencai.configure_runtime_logging(False)
+        self.assertFalse(capture_logger.disabled)
         with patch.object(
             wencai_module,
             "get_robot_data",
@@ -865,6 +1158,16 @@ class TestPyWencaiHelpers(unittest.TestCase):
 
         self.assertTrue(result.empty)
         self.assertEqual(handler.records, [])
+
+    def test_runtime_logging_override_does_not_disable_host_logger(self):
+        capture_logger, handler = self._build_capture_logger("pywencai.host-logger")
+        pywencai.configure_logger(capture_logger)
+        pywencai.configure_runtime_logging(False)
+
+        capture_logger.info("host logger still works")
+
+        self.assertFalse(capture_logger.disabled)
+        self.assertEqual([record.getMessage() for record in handler.records], ["host logger still works"])
 
     def test_runtime_logging_override_can_be_reenabled(self):
         capture_logger, handler = self._build_capture_logger("pywencai.global-toggle")

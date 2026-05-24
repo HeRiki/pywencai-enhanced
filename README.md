@@ -38,7 +38,7 @@ pip install git+https://github.com/HeRiki/pywencai-enhanced.git
 Install a tagged release:
 
 ```bash
-pip install git+https://github.com/HeRiki/pywencai-enhanced.git@v0.2.0
+pip install git+https://github.com/HeRiki/pywencai-enhanced.git@v0.2.1
 ```
 
 For local development:
@@ -85,6 +85,8 @@ df = pywencai.get(
 )
 ```
 
+Use `strict=True` for maintenance jobs, fallback data sources, probes, and other correctness-sensitive paths. Keep the default `strict=False` only when an empty result is a valid business outcome.
+
 ## Supported public API
 
 - `from pywencai import get`
@@ -125,6 +127,9 @@ The current `get(...)` interface remains compatible with these common parameters
 - `log=True` keeps request-path logs enabled.
 - `log=False` keeps the library silent, including auth and parser retry paths.
 - Host applications that need a harder global guarantee can disable runtime logs for the current process. After that, even call sites that still pass `log=True` will stay silent until the host re-enables logging.
+- The runtime logging gate does not set a host application's logger to `disabled=True`, so shared application loggers continue to work.
+- Runtime telemetry, response summaries, exception text, and response headers redact URL query strings and auth fields such as `cookie`, `token`, `iwc_token`, `sessionid`, `sess_tk`, `ticket`, `user_id`, and `urp.user` / `user` permission payloads.
+- Redaction also covers URL-encoded auth payloads, because iWencai can embed fields such as `sess_tk`, `ticket`, and `urp.user` permission payloads inside encoded JSON query values.
 - Host applications can route package logs to their own logger with:
 
 ```python
@@ -191,6 +196,7 @@ Current default policy:
 - `get-robot-data` bypasses the token cache for both the initial request and auth retry
 - this is not a generic preference for "less reuse"; it is a specific mitigation for the observed `robot.initial.401/403 -> refresh success` pattern under higher request rates
 - `page` and `nested` requests still use the normal cache reuse policy
+- `get_page()` only sends whitelisted query, sort, and paging fields in the request body; internal controls such as `cookie`, `user_agent`, `request_params`, `log`, and `strict` are never posted as form data
 
 Do not commit real cookies or generated reports.
 
